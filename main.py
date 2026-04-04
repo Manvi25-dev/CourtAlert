@@ -9,7 +9,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, BackgroundTasks, Header, HTTPException, Request
 from fastapi import Response
 from fastapi.responses import PlainTextResponse
-from pydantic import BaseModel, model_validator
+try:
+    from pydantic.v1 import BaseModel, root_validator
+except ImportError:
+    from pydantic import BaseModel, root_validator
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -200,12 +203,12 @@ class AudioTranscriptionRequest(BaseModel):
     audio_base64: str | None = None
     source_language: str = "en"
 
-    @model_validator(mode="after")
-    def validate_audio_source(self):
-        provided_sources = [bool(self.audio_url), bool(self.audio_base64)]
+    @root_validator(skip_on_failure=True)
+    def validate_audio_source(cls, values):
+        provided_sources = [bool(values.get("audio_url")), bool(values.get("audio_base64"))]
         if sum(provided_sources) != 1:
             raise ValueError("Provide exactly one of audio_url or audio_base64")
-        return self
+        return values
 
 
 def _client_ip(request: Request) -> str:
