@@ -1,0 +1,24 @@
+# Core Dependencies
+fastapi==0.109.0
+uvicorn==0.27.0
+requests==2.31.0
+pydantic==2.5.3
+python-dotenv==1.0.1
+python-multipart==0.0.9
+twilio==9.8.5
+pytest==8.3.5
+httpx==0.27.2
+apscheduler==3.10.4
+
+# PDF Parsing
+pdfplumber==0.10.3
+beautifulsoup4==4.12.2
+
+# Database
+# sqlite3 is standard library
+
+# Security
+# No extra packages needed for basic rate limiting implemented in security.py
+
+# Note: Do NOT install AI-suggested packages blindly.
+# Only install packages that are strictly required and audited.

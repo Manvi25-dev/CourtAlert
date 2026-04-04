@@ -1,0 +1,13 @@
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+.venv/
+.venv - Copy/
+
+# Local runtime artifacts
+.pytest_cache/
+*.log
+courtalert.db
+
+# Secrets
+.env
