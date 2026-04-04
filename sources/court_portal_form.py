@@ -1,12 +1,13 @@
 import logging
-import os
-from pathlib import Path
 from typing import Any
 
-import requests
-from bs4 import BeautifulSoup
-
-from cause_list_fetcher import CAUSE_LIST_URL, parse_cause_list_pdf
+from cause_list_fetcher import CAUSE_LIST_URL
+from cause_list_pipeline import (
+    deduplicate_entries,
+    extract_text,
+    fetch_cause_list,
+    parse_entries,
+)
 from sources.base import SourceAdapter
 
 logger = logging.getLogger(__name__)
@@ -15,73 +16,73 @@ logger = logging.getLogger(__name__)
 class CourtPortalFormAdapter(SourceAdapter):
     """Delhi High Court cause-list adapter using public PDF links."""
 
-    def __init__(self, download_dir: str = "cause_lists"):
-        self.download_dir = Path(download_dir)
-        self.download_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, download_dir: str = "cause_lists", base_url: str = CAUSE_LIST_URL):
+        self.download_dir = download_dir
+        self.base_url = base_url
 
     def fetch(self, hearing_date: str) -> Any:
         del hearing_date
-        session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": "Mozilla/5.0",
-                "Accept": "text/html,application/xhtml+xml,application/xml",
-            }
-        )
         try:
-            response = session.get(CAUSE_LIST_URL, timeout=20)
-            response.raise_for_status()
-            soup = BeautifulSoup(response.text, "html.parser")
-            pdf_urls: list[str] = []
-            for a_tag in soup.find_all("a", href=True):
-                href = a_tag["href"]
-                if not href.lower().endswith(".pdf"):
-                    continue
-                full_url = href if href.startswith("http") else f"https://delhihighcourt.nic.in{href}"
-                pdf_urls.append(full_url)
-
-            logger.info("Delhi HC source discovered %d pdf links", len(pdf_urls))
-            return pdf_urls
+            payload = fetch_cause_list(self.base_url)
+            pdf_count = len(payload.get("pdf_links") or [])
+            logger.info("Delhi HC source discovered %d pdf links", pdf_count)
+            return payload
         except Exception as exc:
             logger.exception("Delhi HC source fetch failed: %s", exc)
-            return []
+            return {"type": "html", "source_url": self.base_url, "html": "", "pdf_links": [], "pdf_bytes": None}
 
     def parse(self, content: Any, hearing_date: str) -> list[dict]:
-        pdf_urls: list[str] = content or []
         parsed_rows: list[dict] = []
 
-        for pdf_url in pdf_urls:
-            try:
-                filename = pdf_url.split("/")[-1]
-                filepath = self.download_dir / filename
-                if not filepath.exists():
-                    dl = requests.get(pdf_url, timeout=20)
-                    dl.raise_for_status()
-                    filepath.write_bytes(dl.content)
+        try:
+            text_blocks = extract_text(content or {}, download_dir=self.download_dir)
+            entries, failed_parses = parse_entries(text_blocks)
+            entries = deduplicate_entries(entries)
 
-                entries, extracted_date = parse_cause_list_pdf(str(filepath))
-                final_date = extracted_date or hearing_date
-                for entry in entries:
-                    case_number = entry.get("case_number") or entry.get("case_no")
-                    if not case_number:
-                        continue
-                    parsed_rows.append(
-                        {
-                            "case_number": case_number,
-                            "title": entry.get("title") or "Unknown Title",
-                            "court": entry.get("court") or "Delhi High Court",
-                            "court_number": entry.get("item") or entry.get("court_number") or "",
-                            "judge": entry.get("judge") or "Unknown Judge",
-                            "status": entry.get("status") or "Listed",
-                            "hearing_date": entry.get("hearing_date") or final_date,
-                            "district": entry.get("district") or "Delhi",
-                            "advocate": entry.get("advocate") or "Unknown Advocate",
-                            "cnr": entry.get("cnr"),
-                            "raw": entry.get("raw") or "",
-                        }
-                    )
-            except Exception as exc:
-                logger.exception("Delhi HC source parse failed for %s: %s", pdf_url, exc)
+            logger.info(
+                "Delhi HC parsing summary: text_blocks=%d entries=%d failed_lines=%d",
+                len(text_blocks),
+                len(entries),
+                len(failed_parses),
+            )
+
+            for idx, entry in enumerate(entries[:5], start=1):
+                logger.info(
+                    "Delhi HC sample %d: case=%s party=%s court_no=%s item_no=%s",
+                    idx,
+                    entry.case_number,
+                    entry.party_names,
+                    entry.court_number,
+                    entry.item_number,
+                )
+
+            for entry in entries:
+                parsed_rows.append(
+                    {
+                        "case_number": entry.case_number,
+                        "case_numbers": [entry.case_number],
+                        "title": entry.party_names or "Unknown Title",
+                        "court": "Delhi High Court",
+                        "court_number": entry.court_number or "",
+                        "item": entry.item_number or "",
+                        "judge": "Unknown Judge",
+                        "status": "Listed",
+                        "hearing_date": hearing_date,
+                        "district": "Delhi",
+                        "advocate": "Unknown Advocate",
+                        "cnr": None,
+                        "raw": entry.case_number,
+                        "source": entry.source_url,
+                    }
+                )
+        except Exception as exc:
+            logger.exception("Delhi HC source parse failed: %s", exc)
+
+        target_hits = [row.get("case_number") for row in parsed_rows if "11440" in str(row.get("case_number") or "")]
+        if target_hits:
+            logger.info("TARGET CASE FOUND IN PARSED ROWS: %s", target_hits[:10])
+        else:
+            logger.info("TARGET CASE NOT FOUND IN PARSED ROWS (search: 11440)")
 
         logger.info("Delhi HC source parsed %d entries", len(parsed_rows))
         return parsed_rows
