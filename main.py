@@ -280,7 +280,12 @@ def webhook(payload: WebhookMessage, request: Request):
 async def whatsapp_webhook(request: Request):
     form = await request.form()
     print("INCOMING:", dict(form))
-    return Response("OK", media_type="text/plain")
+
+    body = form.get("Body", "")
+
+    response_text = f"You said: {body}"
+
+    return Response(response_text, media_type="text/plain")
 
 
 def local_test_whatsapp_webhook_simulation() -> list[dict[str, str]]:
