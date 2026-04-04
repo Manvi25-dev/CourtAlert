@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from models import init_db, get_db_connection
+from models import init_db, get_db_connection, add_user, add_tracked_case
 from ingestion_service import (
     start_scheduler,
     run_ingestion_cycle,
@@ -278,14 +278,60 @@ def webhook(payload: WebhookMessage, request: Request):
     description="Receives inbound Twilio WhatsApp messages, parses commands, and sends appropriate replies.",
 )
 async def whatsapp_webhook(request: Request):
-    form = await request.form()
-    print("INCOMING:", dict(form))
-
-    body = form.get("Body", "")
-
-    response_text = f"You said: {body}"
-
-    return Response(response_text, media_type="text/plain")
+    request_id = uuid4().hex[:12]
+    
+    try:
+        form = await request.form()
+        logger.info("WhatsApp webhook received: request_id=%s form=%s", request_id, dict(form))
+        
+        # Extract phone and message from Twilio form
+        message_text, from_number, _media_url = _extract_whatsapp_fields(dict(form))
+        logger.info("Extracted fields: request_id=%s from=%s message=%s", request_id, from_number, message_text)
+        
+        # Detect case number and action
+        detected_case = _extract_case_number_manual(message_text)
+        action = _detect_action_manual(message_text)
+        
+        logger.info("Detection: request_id=%s case=%s action=%s", request_id, detected_case, action)
+        
+        response_text = ""
+        
+        # Handle "add/track" action with valid case number
+        if action == "add/track" and detected_case:
+            try:
+                # Add user to DB
+                add_user(from_number)
+                logger.info("User added: request_id=%s phone=%s", request_id, from_number)
+                
+                # Add tracked case to DB
+                success = add_tracked_case(from_number, detected_case)
+                
+                if success:
+                    response_text = f"Case {detected_case} is now being tracked."
+                    logger.info("Case stored successfully: request_id=%s phone=%s case=%s", 
+                               request_id, from_number, detected_case)
+                else:
+                    # Case already exists for this user
+                    response_text = f"Case {detected_case} is already being tracked."
+                    logger.info("Case already tracked: request_id=%s phone=%s case=%s", 
+                               request_id, from_number, detected_case)
+            except Exception as db_error:
+                logger.error("DB error while storing case: request_id=%s error=%s", request_id, db_error)
+                response_text = f"Error tracking case {detected_case}. Please try again."
+        else:
+            # Invalid format or no case detected
+            response_text = "Invalid format. Try: add case CRL.M.C. 123/2024"
+            logger.info("Invalid format or no case: request_id=%s action=%s case=%s", 
+                       request_id, action, detected_case)
+        
+        logger.info("WhatsApp response: request_id=%s response=%s", request_id, response_text)
+        
+        # Return immediately to not block Twilio
+        return Response(response_text, media_type="text/plain")
+        
+    except Exception as e:
+        logger.error("WhatsApp webhook error: request_id=%s error=%s", request_id, e, exc_info=True)
+        return Response("Error processing message. Please try again.", media_type="text/plain")
 
 
 def local_test_whatsapp_webhook_simulation() -> list[dict[str, str]]:
