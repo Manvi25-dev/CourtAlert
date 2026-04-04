@@ -213,6 +213,12 @@ def init_db():
     if "cnr" not in hearing_cols:
         cursor.execute("ALTER TABLE hearings ADD COLUMN cnr TEXT")
 
+    # Add reminder tracking columns to alerts table
+    if "alerted_24h" not in alerts_cols:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN alerted_24h BOOLEAN DEFAULT 0")
+    if "alerted_5h" not in alerts_cols:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN alerted_5h BOOLEAN DEFAULT 0")
+
     # Ensure scalable uniqueness constraints.
     cursor.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_cnr_hearing "
@@ -309,6 +315,59 @@ def get_user_cases(phone_number: str) -> List[dict]:
     ).fetchall()
     conn.close()
     return [dict(c) for c in cases]
+
+
+def get_user_alerts_with_hearings(phone_number: str) -> List[dict]:
+    """Fetch user's alerts with associated hearing information."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """SELECT a.*, h.hearing_date, h.court_name, h.case_title, h.advocate
+               FROM alerts a
+               LEFT JOIN hearings h ON a.hearing_id = h.id
+               WHERE a.user_phone = ? AND a.delivery_status = 'pending'
+               ORDER BY h.hearing_date ASC, a.created_at DESC""",
+            (phone_number,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_alerts_for_reminders() -> List[dict]:
+    """Fetch alerts with hearing dates that need 24h or 5h reminders."""
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """SELECT a.*, h.hearing_date
+               FROM alerts a
+               LEFT JOIN hearings h ON a.hearing_id = h.id
+               WHERE a.hearing_date IS NOT NULL 
+               AND h.hearing_date IS NOT NULL
+               AND a.delivery_status = 'pending'
+               AND (a.alerted_24h = 0 OR a.alerted_5h = 0)"""
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def update_alert_reminder_flag(alert_id: int, flag_name: str) -> bool:
+    """Mark a reminder as sent (flag_name: 'alerted_24h' or 'alerted_5h')."""
+    if flag_name not in ('alerted_24h', 'alerted_5h'):
+        logger.warning("Invalid flag_name: %s", flag_name)
+        return False
+    
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            f"UPDATE alerts SET {flag_name} = 1 WHERE id = ?",
+            (alert_id,)
+        )
+        conn.commit()
+        return True
+    finally:
+        conn.close()
 
 def get_all_active_cases() -> List[str]:
     conn = get_db_connection()

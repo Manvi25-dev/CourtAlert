@@ -3,7 +3,7 @@ import os
 import glob
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict
 try:
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -16,7 +16,8 @@ except ImportError:  # pragma: no cover - local fallback for test environments
             return None
 
 from case_matcher import match_cases_and_alert
-from models import delete_advance_list_data, log_ingestion_run
+from models import delete_advance_list_data, log_ingestion_run, get_pending_alerts_for_reminders, update_alert_reminder_flag
+from services.whatsapp_service import send_whatsapp
 from sources import court_sources, today_iso
 
 logger = logging.getLogger(__name__)
@@ -171,12 +172,108 @@ def run_cause_list_check(force_refresh: bool = True):
 
 
 # =====================================================
+# REMINDER ALERTS
+# =====================================================
+
+def send_upcoming_alerts():
+    """
+    Sends WhatsApp reminders 24 hours and 5 hours before scheduled hearings.
+    Runs periodically (every 10 minutes via scheduler).
+    """
+    try:
+        logger.info("Starting reminder alert check...")
+        
+        now = datetime.utcnow()
+        alerts_to_remind = get_pending_alerts_for_reminders()
+        
+        if not alerts_to_remind:
+            logger.debug("No pending alerts with hearing dates")
+            return
+        
+        logger.info("Found %d alerts with hearing dates to check", len(alerts_to_remind))
+        
+        sent_count = 0
+        
+        for alert in alerts_to_remind:
+            try:
+                alert_id = alert.get('id')
+                user_phone = alert.get('user_phone')
+                case_number = alert.get('case_number', 'Unknown')
+                hearing_date_str = alert.get('hearing_date')  # DATE format: YYYY-MM-DD
+                court = alert.get('court', 'Court')
+                advocate = alert.get('advocate', 'N/A')
+                
+                # Parse hearing date (assuming it's a DATE field, add time as 10:00 AM UTC)
+                if not hearing_date_str:
+                    continue
+                
+                try:
+                    hearing_dt = datetime.strptime(hearing_date_str, "%Y-%m-%d")
+                    # Assume hearing is at 10:00 AM UTC
+                    hearing_datetime = hearing_dt.replace(hour=10, minute=0, second=0)
+                except (ValueError, TypeError):
+                    logger.warning("Invalid hearing date format for alert %d: %s", alert_id, hearing_date_str)
+                    continue
+                
+                time_diff = hearing_datetime - now
+                hours_until = time_diff.total_seconds() / 3600
+                
+                # Check 24-hour window (23h to 24h)
+                if 23 < hours_until <= 24 and not alert.get('alerted_24h'):
+                    message = (
+                        f"⏰ Reminder: 24 hours\n\n"
+                        f"Case: {case_number}\n"
+                        f"Hearing: {hearing_date_str}\n"
+                        f"Court: {court}\n\n"
+                        f"Your hearing is in 24 hours."
+                    )
+                    
+                    try:
+                        send_whatsapp(user_phone, message)
+                        update_alert_reminder_flag(alert_id, 'alerted_24h')
+                        logger.info("Sent 24h reminder: alert_id=%d user=%s case=%s", 
+                                   alert_id, user_phone, case_number)
+                        sent_count += 1
+                    except Exception as send_error:
+                        logger.error("Failed to send 24h reminder: alert_id=%d error=%s", 
+                                   alert_id, send_error)
+                
+                # Check 5-hour window (4h to 5h)
+                if 4 < hours_until <= 5 and not alert.get('alerted_5h'):
+                    message = (
+                        f"⚠️ Urgent: 5 hours\n\n"
+                        f"Case: {case_number}\n"
+                        f"Hearing: {hearing_date_str}\n"
+                        f"Court: {court}\n\n"
+                        f"Your hearing is in 5 hours. Please be ready."
+                    )
+                    
+                    try:
+                        send_whatsapp(user_phone, message)
+                        update_alert_reminder_flag(alert_id, 'alerted_5h')
+                        logger.info("Sent 5h reminder: alert_id=%d user=%s case=%s", 
+                                   alert_id, user_phone, case_number)
+                        sent_count += 1
+                    except Exception as send_error:
+                        logger.error("Failed to send 5h reminder: alert_id=%d error=%s", 
+                                   alert_id, send_error)
+                        
+            except Exception as alert_error:
+                logger.error("Error processing alert %d: %s", alert.get('id'), alert_error, exc_info=True)
+        
+        logger.info("Reminder alert check complete: sent %d reminders", sent_count)
+        
+    except Exception as e:
+        logger.error("Error in send_upcoming_alerts: %s", e, exc_info=True)
+
+
+# =====================================================
 # SCHEDULER
 # =====================================================
 
 def start_scheduler():
     """
-    Starts background scheduler to automatically run ingestion periodically.
+    Starts background scheduler to automatically run ingestion and reminder alerts periodically.
     Called on FastAPI startup.
     """
 
@@ -187,6 +284,8 @@ def start_scheduler():
         return
 
     _scheduler = BackgroundScheduler()
+    
+    # Run ingestion cycle every 30 minutes
     _scheduler.add_job(
         run_ingestion_cycle,
         trigger="interval",
@@ -194,9 +293,18 @@ def start_scheduler():
         max_instances=1,
         replace_existing=True,
     )
+    
+    # Run reminder alerts every 10 minutes
+    _scheduler.add_job(
+        send_upcoming_alerts,
+        trigger="interval",
+        minutes=10,
+        max_instances=1,
+        replace_existing=True,
+    )
 
     _scheduler.start()
-    logger.info("Background scheduler started.")
+    logger.info("Background scheduler started (ingestion: 30min, reminders: 10min).")
 
 
 def get_scheduler_status() -> str:

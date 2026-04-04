@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from models import init_db, get_db_connection, add_user, add_tracked_case
+from models import init_db, get_db_connection, add_user, add_tracked_case, get_user_alerts_with_hearings
 from ingestion_service import (
     start_scheduler,
     run_ingestion_cycle,
@@ -318,6 +318,35 @@ async def whatsapp_webhook(request: Request):
             except Exception as db_error:
                 logger.error("DB error while storing case: request_id=%s error=%s", request_id, db_error)
                 response_text = f"Error tracking case {detected_case}. Please try again."
+        
+        # Handle "list/status" action - show user's tracked cases and upcoming hearings
+        elif action == "list/status":
+            try:
+                alerts = get_user_alerts_with_hearings(from_number)
+                logger.info("Fetched alerts for user: request_id=%s phone=%s count=%d", 
+                           request_id, from_number, len(alerts))
+                
+                if not alerts:
+                    response_text = "No upcoming hearings found. We will notify you when listed."
+                else:
+                    # Format response with hearing information
+                    lines = ["Your tracked cases:"]
+                    for i, alert in enumerate(alerts, 1):
+                        case_num = alert.get('case_number', 'Unknown')
+                        hearing_date = alert.get('hearing_date', 'TBD')
+                        court = alert.get('court_name', 'TBD')
+                        
+                        if hearing_date and hearing_date != 'TBD':
+                            lines.append(f"{i}. {case_num} → {hearing_date} ({court})")
+                        else:
+                            lines.append(f"{i}. {case_num} → No upcoming listing yet")
+                    
+                    response_text = "\n".join(lines)
+                    logger.info("Formatted alerts response: request_id=%s count=%d", request_id, len(alerts))
+            except Exception as db_error:
+                logger.error("DB error while fetching alerts: request_id=%s error=%s", request_id, db_error)
+                response_text = "Error fetching your cases. Please try again."
+        
         else:
             # Invalid format or no case detected
             response_text = "Invalid format. Try: add case CRL.M.C. 123/2024"
