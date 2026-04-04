@@ -64,15 +64,26 @@ def normalize_case_number(value: str | None) -> str | None:
 
 
 def normalize_parsed_entry(entry: dict[str, Any], fallback_date: str | None = None) -> dict[str, Any] | None:
+    raw_cases = entry.get("case_numbers") or []
+    normalized_cases: list[str] = []
+    for case_value in raw_cases:
+        canonical_case = normalize_case_number(case_value)
+        if canonical_case:
+            normalized_cases.append(canonical_case)
+
     raw_case = entry.get("case_number") or entry.get("case_no") or entry.get("raw")
     normalized_case = normalize_case_number(raw_case)
+    if normalized_case and normalized_case not in normalized_cases:
+        normalized_cases.insert(0, normalized_case)
+
     cnr = extract_cnr(str(entry.get("cnr") or entry.get("raw") or ""))
-    if not normalized_case and not cnr:
+    if not normalized_cases and not cnr:
         return None
 
     return {
         "cnr": cnr,
-        "case_number": normalized_case,
+        "case_number": normalized_cases[0] if normalized_cases else None,
+        "case_numbers": normalized_cases,
         "title": entry.get("title") or entry.get("raw") or "Unknown Title",
         "court": entry.get("court") or entry.get("bench") or "Unknown Court",
         "court_number": entry.get("court_number") or entry.get("item") or entry.get("item_number") or "",
@@ -120,9 +131,11 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
         parsed_preview = normalize_parsed_entry(entry, hearing_date)
         if not parsed_preview:
             continue
-        parsed_case = parsed_preview.get("case_number") or parsed_preview.get("cnr")
-        if parsed_case:
-            parsed_case_candidates.append(str(parsed_case))
+        case_candidates = parsed_preview.get("case_numbers") or []
+        if case_candidates:
+            parsed_case_candidates.extend([str(case_id) for case_id in case_candidates])
+        elif parsed_preview.get("cnr"):
+            parsed_case_candidates.append(str(parsed_preview.get("cnr")))
     logger.info("TRACKED CASES INPUT: %s", tracked_case_candidates)
     logger.info("PARSED CASES INPUT: %s", parsed_case_candidates)
     
@@ -135,6 +148,7 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
         if not parsed:
             continue
 
+        parsed_cases = parsed.get("case_numbers") or []
         canonical_case = parsed.get("case_number")
         parsed_cnr = parsed.get("cnr")
         parsed_court = (parsed.get("court") or "").strip().lower()
@@ -160,15 +174,19 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
                 matched_tracking_ids.append(("cnr", users))
 
         # 2) Fallback to case number + court.
-        if not matched_tracking_ids and canonical_case:
-            for key in ((canonical_case, parsed_court), (canonical_case, "")):
-                if key not in tracked_case_lookup:
-                    continue
-                collected_users: list[tuple[str, int]] = []
-                for tracked_db_id in tracked_case_lookup[key]:
-                    collected_users.extend(get_users_tracking_case(tracked_db_id))
-                if collected_users:
-                    matched_tracking_ids.append(("case", collected_users))
+        if not matched_tracking_ids and parsed_cases:
+            for candidate_case in parsed_cases:
+                for key in ((candidate_case, parsed_court), (candidate_case, "")):
+                    if key not in tracked_case_lookup:
+                        continue
+                    collected_users: list[tuple[str, int]] = []
+                    for tracked_db_id in tracked_case_lookup[key]:
+                        collected_users.extend(get_users_tracking_case(tracked_db_id))
+                    if collected_users:
+                        canonical_case = candidate_case
+                        matched_tracking_ids.append(("case", collected_users))
+                        break
+                if matched_tracking_ids:
                     break
 
         if matched_tracking_ids:

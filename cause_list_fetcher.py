@@ -250,11 +250,23 @@ def _extract_gurugram_date(text: str) -> str | None:
 def _normalize_case_number(value: str | None) -> str | None:
     if not value:
         return None
-    match = re.search(r"\b([A-Z.]+)[\s/\-]+(\d+)[\s/\-]+(\d{4})\b", value.upper())
+    match = re.search(
+        r"\b([A-Z][A-Z\.\(\)\s-]*?)\s*[-/]?\s*(\d+)\s*(?:[-/]|OF)\s*(\d{4})\b",
+        value.upper(),
+    )
     if not match:
         return None
     case_type, number, year = match.groups()
     case_type = re.sub(r"[^A-Z0-9]", "", case_type)
+    prefixes = ["WITH", "AND", "ITEM", "CASE"]
+    changed = True
+    while changed and case_type:
+        changed = False
+        for prefix in prefixes:
+            if case_type.startswith(prefix) and len(case_type) > len(prefix):
+                case_type = case_type[len(prefix):]
+                changed = True
+                break
     return f"{case_type}/{int(number)}/{year}"
 
 
@@ -355,58 +367,169 @@ def parse_cause_list_pdf(filepath: str) -> ParseResult:
 
 
 def parse_cause_list_entries(text: str) -> ParseResult:
-    """Parse raw cause list text into entry dicts and extracted doc date."""
+    """Parse raw cause-list text into structured case blocks with court context."""
     parse_start = time.perf_counter()
     entries: list[dict] = []
     extracted_date = _extract_advance_date(text) or _extract_gurugram_date(text)
 
-    lines = text.splitlines()
-    current_court_parts: list[str] = []
+    lines = [ln.rstrip() for ln in text.splitlines()[:MAX_PARSE_LINES]]
 
-    for raw_line in lines[:MAX_PARSE_LINES]:
+    def _detect_block_start(line_value: str) -> tuple[str, str] | None:
+        match = re.match(r"^\s*(\d+)\s*[\.)\-]?\s+(.+)$", line_value)
+        if not match:
+            return None
+        item_no = match.group(1)
+        remainder = match.group(2).strip()
+        if not extract_all_case_numbers(remainder):
+            return None
+        return item_no, remainder
+
+    def _extract_parties(block_text: str) -> tuple[str, str]:
+        match = re.search(r"(.+?)\bV/?S\.?\b\s*(.+)", block_text, re.IGNORECASE)
+        if not match:
+            return "", ""
+        petitioner = re.sub(r"\s+", " ", match.group(1)).strip(" -:;")
+        respondent = re.sub(r"\s+", " ", match.group(2)).strip(" -:;")
+        return petitioner, respondent
+
+    def _extract_advocates(block_lines: list[str]) -> str:
+        candidates: list[str] = []
+        for line_value in block_lines:
+            upper = line_value.upper()
+            if "THROUGH" in upper or "ADV" in upper or "COUNSEL" in upper:
+                candidates.append(re.sub(r"\s+", " ", line_value).strip())
+        return " | ".join(candidates)
+
+    def _extract_stage(block_text: str) -> str:
+        stage_keywords = [
+            "FOR ARGUMENT",
+            "FOR ORDERS",
+            "FOR HEARING",
+            "FOR DIRECTIONS",
+            "BAIL",
+            "NOTICE",
+            "FINAL HEARING",
+        ]
+        upper = block_text.upper()
+        for keyword in stage_keywords:
+            if keyword in upper:
+                return keyword
+        return "Listed"
+
+    def _extract_time(block_text: str) -> str | None:
+        time_match = re.search(r"\b(\d{1,2}:\d{2}\s*(?:AM|PM))\b", block_text, re.IGNORECASE)
+        if time_match:
+            return time_match.group(1).upper()
+        return None
+
+    current_court_no = ""
+    current_judges: list[str] = []
+    current_date = extracted_date
+
+    blocks: list[dict] = []
+    active_block: dict | None = None
+
+    for raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
 
-        upper = line.upper()
-        if "COURT NO" in upper:
-            current_court_parts = [line]
+        # STEP 1: detect court header and judge context.
+        court_match = re.search(r"COURT\s*NO\.?\s*([A-Z0-9-]+)", line, re.IGNORECASE)
+        if court_match:
+            current_court_no = court_match.group(1)
+            current_judges = []
             continue
 
-        if "HON'BLE" in upper:
-            if current_court_parts:
-                current_court_parts.append(line)
-            else:
-                current_court_parts = [line]
+        if "HON'BLE" in line.upper() or line.upper().startswith("CORAM"):
+            current_judges.append(re.sub(r"\s+", " ", line).strip())
             continue
 
-        cases = extract_all_case_numbers(line)
-        if not cases:
+        inline_date = _extract_advance_date(line) or _extract_gurugram_date(line)
+        if inline_date:
+            current_date = inline_date
+
+        # STEP 2: split into structured case blocks by item number + case number.
+        block_start = _detect_block_start(line)
+        if block_start:
+            if active_block:
+                blocks.append(active_block)
+            item_no, remainder = block_start
+            active_block = {
+                "item_number": item_no,
+                "lines": [remainder],
+                "court_no": current_court_no,
+                "judges": list(current_judges),
+                "hearing_date": current_date,
+            }
             continue
 
-        court_label = " | ".join(current_court_parts) if current_court_parts else "Unknown Court"
-        item_match = re.match(r"^(\d+)\.", line)
-        item_no = item_match.group(1) if item_match else "Unknown"
+        if active_block:
+            active_block["lines"].append(line)
 
-        for case in cases:
-            normalized_case = _normalize_case_number(case)
-            logger.info("PARSE NORMALIZATION: raw_case=%s normalized_case=%s", case, normalized_case)
-            entries.append(
-                {
-                    "case_no": case,
-                    "court": court_label,
-                    "item": item_no,
-                    "raw": line,
-                }
-            )
+    if active_block:
+        blocks.append(active_block)
 
+    # STEP 3/4/5: parse each block and normalize all case numbers.
+    for block in blocks:
+        block_lines = block.get("lines", [])
+        block_text = " ".join(block_lines)
+        raw_case_numbers = extract_all_case_numbers(block_text)
+        normalized_case_numbers: list[str] = []
+        for raw_case in raw_case_numbers:
+            normalized_case = _normalize_case_number(raw_case)
+            logger.info("PARSE NORMALIZATION: raw_case=%s normalized_case=%s", raw_case, normalized_case)
+            if normalized_case:
+                normalized_case_numbers.append(normalized_case)
+
+        if not normalized_case_numbers:
+            continue
+
+        petitioner, respondent = _extract_parties(block_text)
+        advocates = _extract_advocates(block_lines)
+        stage = _extract_stage(block_text)
+        hearing_time = _extract_time(block_text)
+        court_label = f"Court {block.get('court_no')}" if block.get("court_no") else "Unknown Court"
+
+        entries.append(
+            {
+                "item": block.get("item_number") or "Unknown",
+                "item_number": block.get("item_number") or "Unknown",
+                "case_numbers": normalized_case_numbers,
+                "case_number": normalized_case_numbers[0],
+                "case_no": normalized_case_numbers[0],
+                "petitioner": petitioner,
+                "respondent": respondent,
+                "title": (
+                    f"{petitioner} vs {respondent}".strip()
+                    if petitioner or respondent
+                    else "Unknown Title"
+                ),
+                "advocate": advocates or "Unknown Advocate",
+                "court": court_label,
+                "court_no": block.get("court_no") or "",
+                "judge": " | ".join(block.get("judges") or []) or "Unknown Judge",
+                "hearing_date": block.get("hearing_date") or extracted_date,
+                "hearing_time": hearing_time,
+                "status": stage,
+                "stage": stage,
+                "raw": block_text,
+            }
+        )
+
+    # STEP 7: structured output with parsed preview logs.
     parsed_preview = []
     for entry in entries[:20]:
-        candidate = entry.get("case_no") or entry.get("case_number")
-        canonical = _normalize_case_number(candidate)
-        if canonical:
-            parsed_preview.append(canonical)
+        case_candidates = entry.get("case_numbers") or []
+        if case_candidates:
+            parsed_preview.append(case_candidates[0])
     logger.info("Parsed cases (first 20): %s", ", ".join(parsed_preview) if parsed_preview else "none")
+
+    target_found = any(
+        any("11440" in case_no or "CMAPPL" in case_no for case_no in (entry.get("case_numbers") or []))
+        for entry in entries
+    )
+    logger.info("Target case search (11440/CMAPPL): %s", "FOUND" if target_found else "NOT_FOUND")
 
     logger.info(
         "Entries extracted: count=%d, date=%s, parse_time=%.2fs",

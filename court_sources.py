@@ -67,11 +67,23 @@ def resolve_court_from_case(case_number: str | None, message: str | None = None)
 def _normalize_case_number(value: str | None) -> str | None:
     if not value:
         return None
-    match = re.search(r"\b([A-Z.]+)[\s/\-]+(\d+)[\s/\-]+(\d{4})\b", value.upper())
+    match = re.search(
+        r"\b([A-Z][A-Z\.\(\)\s-]*?)\s*[-/]?\s*(\d+)\s*(?:[-/]|OF)\s*(\d{4})\b",
+        value.upper(),
+    )
     if not match:
         return None
     case_type, number, year = match.groups()
     case_type = re.sub(r"[^A-Z0-9]", "", case_type)
+    prefixes = ["WITH", "AND", "ITEM", "CASE"]
+    changed = True
+    while changed and case_type:
+        changed = False
+        for prefix in prefixes:
+            if case_type.startswith(prefix) and len(case_type) > len(prefix):
+                case_type = case_type[len(prefix):]
+                changed = True
+                break
     return f"{case_type}/{int(number)}/{year}"
 
 
