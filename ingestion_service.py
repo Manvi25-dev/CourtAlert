@@ -37,6 +37,7 @@ _last_ingestion_summary: Dict[str, Any] = {
     "alerts_generated": 0,
     "errors": [],
 }
+_last_parsed_entries: list[dict[str, Any]] = []
 
 
 # =====================================================
@@ -45,6 +46,12 @@ _last_ingestion_summary: Dict[str, Any] = {
 
 def get_ingestion_summary() -> Dict[str, Any]:
     return dict(_last_ingestion_summary)
+
+
+def get_last_parsed_entries(limit: int = 50) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    return _last_parsed_entries[:limit]
 
 
 def is_ingestion_running() -> bool:
@@ -94,6 +101,7 @@ def run_ingestion_cycle(force_refresh: bool = False):
         for source_name, source in court_sources.items():
             source_start = time.perf_counter()
             try:
+                logger.info("SOURCE START: source_name=%s", source_name)
                 entries = source.fetch_cases(cycle_date)
                 all_source_results.append((source_name, entries))
                 logger.info(
@@ -102,6 +110,18 @@ def run_ingestion_cycle(force_refresh: bool = False):
                     len(entries),
                     time.perf_counter() - source_start,
                 )
+                logger.info("SOURCE SUMMARY: source_name=%s entries_fetched=%d", source_name, len(entries))
+
+                target_hits = []
+                for row in entries:
+                    candidate = str(row.get("case_number") or row.get("case_no") or row.get("raw") or "")
+                    compact = "".join(ch for ch in candidate.upper() if ch.isalnum())
+                    if "11440" in compact or "CMAPPL" in compact:
+                        target_hits.append(candidate)
+                if target_hits:
+                    logger.info("TARGET CASE FOUND IN SOURCE %s: %s", source_name, target_hits[:10])
+                else:
+                    logger.info("TARGET CASE NOT FOUND IN SOURCE %s (search: 11440/CMAPPL)", source_name)
             except Exception as exc:
                 logger.exception("Source '%s' failed", source_name)
                 summary["errors"].append({"source": source_name, "error": str(exc)})
@@ -126,6 +146,22 @@ def run_ingestion_cycle(force_refresh: bool = False):
         for source_name, entries in all_source_results:
             if not entries:
                 continue
+
+            # Capture parsed rows for debug endpoint.
+            for row in entries:
+                raw_case = row.get("case_number") or row.get("case_no") or row.get("raw") or ""
+                normalized_case = row.get("case_number")
+                _last_parsed_entries.insert(
+                    0,
+                    {
+                        "source": source_name,
+                        "raw_case": raw_case,
+                        "normalized_case": normalized_case,
+                        "hearing_date": row.get("hearing_date"),
+                        "court": row.get("court"),
+                    },
+                )
+            del _last_parsed_entries[500:]
 
             source_start = time.perf_counter()
             try:

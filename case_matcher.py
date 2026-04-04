@@ -115,6 +115,16 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
         len(tracked_cnrs),
     )
     tracked_case_candidates = sorted({case_id for case_id, _court in tracked_case_lookup.keys()})
+    parsed_case_candidates: list[str] = []
+    for entry in parsed_entries:
+        parsed_preview = normalize_parsed_entry(entry, hearing_date)
+        if not parsed_preview:
+            continue
+        parsed_case = parsed_preview.get("case_number") or parsed_preview.get("cnr")
+        if parsed_case:
+            parsed_case_candidates.append(str(parsed_case))
+    logger.info("TRACKED CASES INPUT: %s", tracked_case_candidates)
+    logger.info("PARSED CASES INPUT: %s", parsed_case_candidates)
     
     match_count = 0
     
@@ -136,6 +146,11 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
             canonical_case,
             parsed_cnr,
             tracked_case_candidates,
+        )
+        logger.info(
+            "NORMALIZATION TRACE: raw=%s normalized=%s",
+            entry.get("case_number") or entry.get("case_no") or entry.get("raw"),
+            canonical_case,
         )
 
         # 1) CNR-first matching.

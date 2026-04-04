@@ -389,6 +389,8 @@ def parse_cause_list_entries(text: str) -> ParseResult:
         item_no = item_match.group(1) if item_match else "Unknown"
 
         for case in cases:
+            normalized_case = _normalize_case_number(case)
+            logger.info("PARSE NORMALIZATION: raw_case=%s normalized_case=%s", case, normalized_case)
             entries.append(
                 {
                     "case_no": case,
@@ -397,6 +399,14 @@ def parse_cause_list_entries(text: str) -> ParseResult:
                     "raw": line,
                 }
             )
+
+    parsed_preview = []
+    for entry in entries[:20]:
+        candidate = entry.get("case_no") or entry.get("case_number")
+        canonical = _normalize_case_number(candidate)
+        if canonical:
+            parsed_preview.append(canonical)
+    logger.info("Parsed cases (first 20): %s", ", ".join(parsed_preview) if parsed_preview else "none")
 
     logger.info(
         "Entries extracted: count=%d, date=%s, parse_time=%.2fs",

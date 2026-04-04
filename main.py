@@ -29,6 +29,7 @@ from ingestion_service import (
     start_scheduler,
     run_ingestion_cycle,
     get_ingestion_summary,
+    get_last_parsed_entries,
     is_ingestion_running,
     get_scheduler_status,
 )
@@ -690,6 +691,21 @@ def test_whatsapp():
         "⚖️ CourtAlert Test from Backend",
     )
     return {"status": "sent", "sid": sid}
+
+
+@app.get(
+    "/debug/parsed-cases",
+    tags=["System"],
+    summary="Debug parsed cases",
+    description="Returns cached parsed entries from recent ingestion runs.",
+)
+def debug_parsed_cases(limit: int = 50):
+    safe_limit = max(1, min(limit, 200))
+    rows = get_last_parsed_entries(safe_limit)
+    return {
+        "count": len(rows),
+        "parsed_cases": rows,
+    }
 
 
 @app.get(
