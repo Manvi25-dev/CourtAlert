@@ -91,12 +91,12 @@ def fetch_cause_list_pdfs() -> list[str]:
             filename = full_url.split("/")[-1]
             filepath = os.path.join(PDF_DIR, filename)
 
-            if not os.path.exists(filepath):
-                dl = session.get(full_url, timeout=HTTP_TIMEOUT_SECONDS)
-                dl.raise_for_status()
-                with open(filepath, "wb") as f:
-                    f.write(dl.content)
-                logger.info("PDF downloaded: %s", filename)
+            # Always refresh Delhi files to avoid stale local copies when the court republishes a PDF with the same name.
+            dl = session.get(full_url, timeout=HTTP_TIMEOUT_SECONDS)
+            dl.raise_for_status()
+            with open(filepath, "wb") as f:
+                f.write(dl.content)
+            logger.info("PDF refreshed: %s", filename)
 
             downloaded_files.append(filepath)
     except Exception as exc:
@@ -179,11 +179,73 @@ def fetch_gurugram_district_pdfs(download_dir: str = PDF_DIR, days: int = 3) -> 
     return saved_files
 
 
-def extract_text_from_pdf(filepath: str) -> str:
-    """Extract text from PDF and optionally fall back to OCR when available."""
-    extract_start = time.perf_counter()
-    text = ""
+def normalize_text_block(text: str) -> str:
+    """Aggressive normalization to fix broken case patterns and whitespace."""
+    # Uppercase for consistency
+    text = text.upper()
+    
+    # Normalize whitespace
+    text = re.sub(r"\s+", " ", text)
+    
+    # Fix broken case type patterns: CM APPL. -> CMAPPL
+    text = re.sub(r"CM\s*APPL\.?", "CMAPPL", text)
+    text = re.sub(r"CRL\s*MC", "CRLMC", text)
+    text = re.sub(r"WP\s*\(C\)", "WPC", text)
+    
+    # Fix broken separators: / spaces / -> /
+    text = re.sub(r"\s*/\s*", "/", text)
+    text = re.sub(r"\s*-\s*", "-", text)
+    
+    # Fix broken number-year patterns split by whitespace or newlines
+    # Pattern: digit spaces digit{4} -> digit/digit{4}
+    text = re.sub(r"(\d)\s+(/\s*)?(/)?\s*(\d{4})", r"\1/\4", text)
+    
+    return text.strip()
 
+
+def extract_text_from_pdf(filepath: str) -> str:
+    """Extract text from PDF using pdfplumber for better table support, with PyPDF2 fallback."""
+    extract_start = time.perf_counter()
+    full_text = []
+    page_count = 0
+
+    # PRIMARY: Try pdfplumber for structured extraction (text + tables)
+    if pdfplumber is not None:
+        try:
+            with pdfplumber.open(filepath) as pdf:
+                for page_idx, page in enumerate(pdf.pages):
+                    if page_idx >= MAX_PDF_PAGES:
+                        logger.warning("Page limit reached while extracting text from %s", filepath)
+                        break
+                    
+                    page_count += 1
+                    
+                    # Extract plain text
+                    page_text = page.extract_text() or ""
+                    if page_text:
+                        full_text.append(page_text)
+                    
+                    # Extract table data and convert to text
+                    tables = page.extract_tables() or []
+                    for table_idx, table in enumerate(tables):
+                        for row_idx, row in enumerate(table):
+                            # Join cells with space, preserving structure
+                            row_text = " ".join([str(cell or "").strip() for cell in row])
+                            if row_text.strip():
+                                full_text.append(row_text)
+                    
+                    logger.debug("Extracted page %d from %s: text_length=%d tables=%d", 
+                                page_idx, filepath, len(page_text), len(tables))
+            
+            extracted = "\n".join(full_text)
+            logger.info("PDF extraction via pdfplumber: %s pages=%d text_bytes=%d", 
+                       filepath, page_count, len(extracted))
+            return extracted
+        except Exception as exc:
+            logger.warning("pdfplumber extraction failed for %s, trying PyPDF2: %s", filepath, exc)
+            full_text = []  # Reset and try fallback
+
+    # FALLBACK: PyPDF2 for basic text extraction
     if PyPDF2 is not None:
         try:
             with open(filepath, "rb") as f:
@@ -194,11 +256,13 @@ def extract_text_from_pdf(filepath: str) -> str:
                         break
                     extracted = page.extract_text()
                     if extracted:
-                        text += extracted + "\n"
+                        full_text.append(extracted)
+                        page_count += 1
         except Exception as exc:
             logger.error("PyPDF2 failed for %s: %s", filepath, exc)
 
-    if len(text.strip()) < 100 and convert_from_path and pytesseract:
+    # LAST RESORT: OCR if extraction too sparse
+    if len("\n".join(full_text).strip()) < 100 and convert_from_path and pytesseract:
         try:
             try:
                 images = convert_from_path(filepath, timeout=HTTP_TIMEOUT_SECONDS)
@@ -208,12 +272,18 @@ def extract_text_from_pdf(filepath: str) -> str:
                 if idx >= MAX_PDF_PAGES:
                     logger.warning("OCR image limit reached while parsing %s", filepath)
                     break
-                text += pytesseract.image_to_string(img) + "\n"
+                ocr_text = pytesseract.image_to_string(img)
+                if ocr_text:
+                    full_text.append(ocr_text)
+                    page_count += 1
+            logger.info("OCR fallback used for %s: pages=%d", filepath, page_count)
         except Exception as exc:
             logger.error("OCR failed for %s: %s", filepath, exc)
 
-    logger.info("Parsing PDF completed: %s in %.2fs", filepath, time.perf_counter() - extract_start)
-    return text
+    result = "\n".join(full_text)
+    logger.info("PDF extraction completed: filepath=%s pages=%d bytes=%d duration=%.2fs", 
+               filepath, page_count, len(result), time.perf_counter() - extract_start)
+    return result
 
 
 def _extract_advance_date(text: str) -> str | None:
@@ -372,10 +442,16 @@ def parse_cause_list_entries(text: str) -> ParseResult:
     entries: list[dict] = []
     extracted_date = _extract_advance_date(text) or _extract_gurugram_date(text)
 
+    # Parse lines BEFORE normalizing (preserve structure for block detection)
     lines = [ln.rstrip() for ln in text.splitlines()[:MAX_PARSE_LINES]]
+    
+    # DEBUG: Log if target case visible in raw text
+    raw_text = " ".join(lines)
+    if "11440" in raw_text or "CMAPPL" in raw_text.upper():
+        logger.info("DEBUG_INPUT: Target case 11440/CMAPPL detected in raw text")
 
     def _detect_block_start(line_value: str) -> tuple[str, str] | None:
-        match = re.match(r"^\s*(\d+)\s*[\.)\-]?\s+(.+)$", line_value)
+        match = re.match(r"^\s*(\d+)\s*[\.\)\-]?\s+(.+)$", line_value)
         if not match:
             return None
         item_no = match.group(1)
@@ -470,15 +546,16 @@ def parse_cause_list_entries(text: str) -> ParseResult:
     if active_block:
         blocks.append(active_block)
 
-    # STEP 3/4/5: parse each block and normalize all case numbers.
+    # STEP 3: Process blocks with multi-line case number extraction
     for block in blocks:
         block_lines = block.get("lines", [])
-        block_text = " ".join(block_lines)
-
-        # Step 1/2: scan all lines before V/s as the case cluster.
+        
+        # BLOCK-BASED APPROACH: Group lines and search for cases
+        # Join 5-10 lines to handle split case numbers
         case_cluster_lines: list[str] = []
         tail_lines: list[str] = []
         seen_vs = False
+        
         for line in block_lines:
             if re.search(r"\bV/?S\.?\b", line, re.IGNORECASE):
                 seen_vs = True
@@ -489,15 +566,27 @@ def parse_cause_list_entries(text: str) -> ParseResult:
             else:
                 tail_lines.append(line)
 
-        case_cluster_text = "\n".join(case_cluster_lines) if case_cluster_lines else block_text
-        raw_case_numbers = extract_all_case_numbers(case_cluster_text)
+        # Construct block text and normalize it for case extraction
+        block_text = " ".join(block_lines)
+        case_cluster_text = " ".join(case_cluster_lines) if case_cluster_lines else block_text
+        
+        # NORMALIZE for case extraction (more robust with broken PDFs)
+        normalized_cluster = normalize_text_block(case_cluster_text)
+        normalized_block = normalize_text_block(block_text)
+        
+        # DEBUG: Log block text if target case present
+        if "11440" in normalized_block or "CMAPPL" in normalized_block.upper():
+            logger.info("DEBUG_BLOCK: item=%s normalized_text=%s", block.get("item_number"), normalized_block[:200])
+        
+        # Extract case numbers from normalized text for robustness
+        raw_case_numbers = extract_all_case_numbers(normalized_cluster)
         if not raw_case_numbers:
-            raw_case_numbers = extract_all_case_numbers(block_text)
+            raw_case_numbers = extract_all_case_numbers(normalized_block)
 
         normalized_case_numbers: list[str] = []
         for raw_case in raw_case_numbers:
             normalized_case = _normalize_case_number(raw_case)
-            logger.info("PARSE NORMALIZATION: raw_case=%s normalized_case=%s", raw_case, normalized_case)
+            logger.info("PARSE_NORMALIZATION: raw=%s normalized=%s", raw_case, normalized_case)
             if normalized_case:
                 normalized_case_numbers.append(normalized_case)
 
@@ -505,7 +594,7 @@ def parse_cause_list_entries(text: str) -> ParseResult:
             continue
 
         logger.info(
-            "BLOCK CASE CLUSTER: item=%s cases=%s",
+            "BLOCK_CASE_CLUSTER: item=%s cases=%s",
             block.get("item_number") or "Unknown",
             normalized_case_numbers,
         )
@@ -554,10 +643,10 @@ def parse_cause_list_entries(text: str) -> ParseResult:
         any("11440" in case_no or "CMAPPL" in case_no for case_no in (entry.get("case_numbers") or []))
         for entry in entries
     )
-    logger.info("Target case search (11440/CMAPPL): %s", "FOUND" if target_found else "NOT_FOUND")
+    logger.info("TARGET_CASE_SEARCH: result=%s", "FOUND" if target_found else "NOT_FOUND")
 
     logger.info(
-        "Entries extracted: count=%d, date=%s, parse_time=%.2fs",
+        "ENTRIES_EXTRACTED: count=%d date=%s duration=%.2fs",
         len(entries),
         extracted_date,
         time.perf_counter() - parse_start,

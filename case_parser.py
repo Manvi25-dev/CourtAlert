@@ -8,6 +8,7 @@ DISPLAY_TYPE_MAP = {
     "FAOOS": "FAO(OS)",
     "CRLA": "CRL.A.",
     "CMM": "CM(M)",
+    "CMAPPL": "CM APPL",  # Add normalized form
 }
 
 def normalize_case_id(case_number: str) -> str:
@@ -91,33 +92,66 @@ def parse_case_number(text: str) -> str:
 def extract_all_case_numbers(text: str) -> list[str]:
     """
     Extract ALL valid case numbers from a text block.
-    Returns a list of original case strings found.
+    Handles multi-line and broken layouts:
+    - CM APPL. 11440/2026
+    - CMAPPL 11440 / 2026  
+    - CM APPL 11440 / 2026 (split)
+    Returns list of original case strings found.
     """
     if not text:
         return []
-        
-    # Regex to find potential case patterns
-    # Type (letters/dots/parens) + Number + / + Year
-    # We use a broad pattern to capture candidates, then validate/normalize them
-    # Updated to support "OF" as separator
-    pattern = r'(?<![a-zA-Z])([A-Z][A-Z\.\(\)\s-]*?\s*[-/]?\s*\d+\s*(?:[-/]|OF)\s*\d{4})'
     
-    candidates = re.findall(pattern, text, re.IGNORECASE)
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # Normalize for matching
+    normalized = text.upper()
+    normalized = re.sub(r"\s+", " ", normalized)
+    normalized = re.sub(r"CM\s*APPL\.?", "CMAPPL", normalized)
+    
+    candidates = []
+    
+    # PATTERN 1: Normalized forms like "CMAPPL 11440/2026" or "CMAPPL 11440 / 2026"
+    # Capture with separator preserved
+    pattern1 = r'(CMAPPL|CRLMC|WPC|CSCOMM|FAOOS|CRLA|CMM)\s+(\d+)\s*([-/]|OF)\s*(\d{4})'
+    matches1 = re.finditer(pattern1, normalized, re.IGNORECASE)
+    for match in matches1:
+        case_type = match.group(1).strip()
+        number = match.group(2)
+        sep = match.group(3).strip() or "/"
+        year = match.group(4)
+        candidate = f"{case_type} {number}{sep}{year}".strip()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    
+    # PATTERN 2: Flexible forms with letters/dots/spaces
+    # TYPE + NUMBER + SEPARATOR + YEAR (flexible spacing)
+    pattern2 = r'(?<![a-zA-Z])([A-Z][A-Z\.\(\)\s-]*?)\s*[-/]?\s*(\d+)\s*([-/]|OF)\s*(\d{4})(?![\w/])'
+    
+    matches2 = re.finditer(pattern2, normalized, re.IGNORECASE)
+    for match in matches2:
+        case_type = match.group(1).strip()
+        number = match.group(2)
+        sep = match.group(3).strip() or "/"
+        year = match.group(4)
+        candidate = f"{case_type} {number}{sep}{year}".strip()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    
     valid_cases = []
-    
-    # Filter out noise words that might look like types
     NOISE_WORDS = {"CASE", "FILED", "AGAINST", "SAME", "FIR", "NO", "DATED", "ORDER", "ITEM", "ADD", "TRACK"}
     
     for candidate in candidates:
-        # Check if it normalizes correctly
         norm = normalize_case_id(candidate)
         if norm:
-            # Check if the type is just a noise word
             type_part = norm.split('-')[0]
-            if type_part in NOISE_WORDS:
-                continue
-            valid_cases.append(candidate.strip())
-            
+            if type_part not in NOISE_WORDS and len(type_part) >= 2:
+                logger.debug("EXTRACT_CASE: %s -> %s", candidate, norm)
+                valid_cases.append(candidate.strip())
+    
+    if "11440" in text:
+        logger.debug("TARGET_11440: candidates=%d valid=%d text_sample=%s", len(candidates), len(valid_cases), text[:100])
+    
     return valid_cases
 
 def normalize_for_comparison(case_number: str) -> str:
