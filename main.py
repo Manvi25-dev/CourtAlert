@@ -17,7 +17,14 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from models import init_db, get_db_connection, add_user, add_tracked_case, get_user_alerts_with_hearings
+from models import (
+    init_db,
+    get_db_connection,
+    add_user,
+    add_tracked_case,
+    get_user_cases,
+    get_user_alerts_with_hearings,
+)
 from ingestion_service import (
     start_scheduler,
     run_ingestion_cycle,
@@ -96,7 +103,14 @@ def _detect_action_manual(message_text: str) -> str:
     upper = (message_text or "").strip().upper()
     if upper.startswith("ADD CASE ") or upper.startswith("ADD "):
         return "add/track"
-    if upper.startswith("CHECK") or upper.startswith("STATUS") or upper.startswith("LIST"):
+    if (
+        upper.startswith("CHECK")
+        or upper.startswith("STATUS")
+        or upper.startswith("LIST")
+        or "WHEN IS IT" in upper
+        or "NEXT HEARING" in upper
+        or "UPDATE ME ON MY CASES" in upper
+    ):
         return "list/status"
     return "fallback"
 
@@ -288,16 +302,22 @@ async def whatsapp_webhook(request: Request):
         message_text, from_number, _media_url = _extract_whatsapp_fields(dict(form))
         logger.info("Extracted fields: request_id=%s from=%s message=%s", request_id, from_number, message_text)
         
-        # Detect case number and action
-        detected_case = _extract_case_number_manual(message_text)
+        # Detect intent first, then route.
         action = _detect_action_manual(message_text)
-        
-        logger.info("Detection: request_id=%s case=%s action=%s", request_id, detected_case, action)
+        logger.info("Intent detected: request_id=%s action=%s", request_id, action)
         
         response_text = ""
         
         # Handle "add/track" action with valid case number
-        if action == "add/track" and detected_case:
+        if action == "add/track":
+            detected_case = _extract_case_number_manual(message_text)
+            logger.info("Add intent details: request_id=%s phone=%s case=%s", request_id, from_number, detected_case)
+
+            if not detected_case:
+                response_text = "Invalid format. Try: add case CRL.M.C. 123/2024"
+                logger.info("Add intent without case: request_id=%s phone=%s", request_id, from_number)
+                return Response(response_text, media_type="text/plain")
+
             try:
                 # Add user to DB
                 add_user(from_number)
@@ -322,36 +342,50 @@ async def whatsapp_webhook(request: Request):
         # Handle "list/status" action - show user's tracked cases and upcoming hearings
         elif action == "list/status":
             try:
+                user_cases = get_user_cases(from_number)
                 alerts = get_user_alerts_with_hearings(from_number)
-                logger.info("Fetched alerts for user: request_id=%s phone=%s count=%d", 
-                           request_id, from_number, len(alerts))
-                
-                if not alerts:
-                    response_text = "No upcoming hearings found. We will notify you when listed."
+                logger.info(
+                    "Fetched status data: request_id=%s phone=%s cases=%d alerts=%d",
+                    request_id,
+                    from_number,
+                    len(user_cases),
+                    len(alerts),
+                )
+
+                if not user_cases:
+                    response_text = "You are not tracking any cases yet."
                 else:
-                    # Format response with hearing information
+                    latest_by_case: dict[str, dict] = {}
+                    for alert in alerts:
+                        case_num = str(alert.get("case_number") or "").strip()
+                        if not case_num:
+                            continue
+                        current = latest_by_case.get(case_num)
+                        if not current:
+                            latest_by_case[case_num] = alert
+                            continue
+                        curr_date = str(current.get("hearing_date") or "")
+                        new_date = str(alert.get("hearing_date") or "")
+                        if new_date and (not curr_date or new_date > curr_date):
+                            latest_by_case[case_num] = alert
+
                     lines = ["Your tracked cases:"]
-                    for i, alert in enumerate(alerts, 1):
-                        case_num = alert.get('case_number', 'Unknown')
-                        hearing_date = alert.get('hearing_date', 'TBD')
-                        court = alert.get('court_name', 'TBD')
-                        
-                        if hearing_date and hearing_date != 'TBD':
-                            lines.append(f"{i}. {case_num} → {hearing_date} ({court})")
+                    for i, case_row in enumerate(user_cases, 1):
+                        case_num = str(case_row.get("case_number") or "Unknown")
+                        latest = latest_by_case.get(case_num)
+                        if latest and latest.get("hearing_date"):
+                            lines.append(f"{i}. {case_num} -> Next hearing: {latest['hearing_date']}")
                         else:
-                            lines.append(f"{i}. {case_num} → No upcoming listing yet")
-                    
+                            lines.append(f"{i}. {case_num} -> No upcoming listing yet")
+
                     response_text = "\n".join(lines)
-                    logger.info("Formatted alerts response: request_id=%s count=%d", request_id, len(alerts))
             except Exception as db_error:
                 logger.error("DB error while fetching alerts: request_id=%s error=%s", request_id, db_error)
                 response_text = "Error fetching your cases. Please try again."
         
         else:
-            # Invalid format or no case detected
-            response_text = "Invalid format. Try: add case CRL.M.C. 123/2024"
-            logger.info("Invalid format or no case: request_id=%s action=%s case=%s", 
-                       request_id, action, detected_case)
+            response_text = "I didn't understand. Try:\n- add case CRL.M.C. 123/2024\n- when is it?"
+            logger.info("Fallback action: request_id=%s action=%s phone=%s", request_id, action, from_number)
         
         logger.info("WhatsApp response: request_id=%s response=%s", request_id, response_text)
         
