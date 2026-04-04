@@ -114,6 +114,7 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
         len(tracked_case_lookup),
         len(tracked_cnrs),
     )
+    tracked_case_candidates = sorted({case_id for case_id, _court in tracked_case_lookup.keys()})
     
     match_count = 0
     
@@ -129,6 +130,13 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
         parsed_court = (parsed.get("court") or "").strip().lower()
 
         matched_tracking_ids: list[tuple[str, list[tuple[str, int]]]] = []
+
+        logger.info(
+            "Parsed case=%s cnr=%s compared against tracked_cases=%s",
+            canonical_case,
+            parsed_cnr,
+            tracked_case_candidates,
+        )
 
         # 1) CNR-first matching.
         if parsed_cnr and parsed_cnr in tracked_cnrs:
@@ -215,6 +223,8 @@ def match_cases_and_alert(parsed_entries: list[dict], source_pdf: str, hearing_d
                         "Alert created",
                         extra={"cnr": parsed_cnr, "case_number": canonical_case, "hearing_date": final_hearing_date},
                     )
+        else:
+            logger.info("NO MATCH for parsed case: %s", canonical_case or parsed_cnr or "UNKNOWN")
 
     logger.info("Matching complete. Found %s matches.", match_count)
     return generated_alerts

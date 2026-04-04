@@ -355,6 +355,33 @@ async def whatsapp_webhook(request: Request):
                 if not user_cases:
                     response_text = "You are not tracking any cases yet."
                 else:
+                    latest_hearing_by_case: dict[str, dict] = {}
+                    normalized_case_ids = [
+                        str(case_row.get("normalized_case_id") or case_row.get("case_number") or "").strip()
+                        for case_row in user_cases
+                    ]
+                    normalized_case_ids = [case_id for case_id in normalized_case_ids if case_id]
+                    if normalized_case_ids:
+                        conn = get_db_connection()
+                        try:
+                            placeholders = ",".join("?" for _ in normalized_case_ids)
+                            hearing_rows = conn.execute(
+                                f"""
+                                SELECT normalized_case_id, hearing_date, court_name, created_at
+                                FROM hearings
+                                WHERE normalized_case_id IN ({placeholders})
+                                ORDER BY hearing_date DESC, created_at DESC
+                                """,
+                                tuple(normalized_case_ids),
+                            ).fetchall()
+                            for row in hearing_rows:
+                                row_dict = dict(row)
+                                key = str(row_dict.get("normalized_case_id") or "").strip()
+                                if key and key not in latest_hearing_by_case:
+                                    latest_hearing_by_case[key] = row_dict
+                        finally:
+                            conn.close()
+
                     latest_by_case: dict[str, dict] = {}
                     for alert in alerts:
                         case_num = str(alert.get("case_number") or "").strip()
@@ -372,11 +399,20 @@ async def whatsapp_webhook(request: Request):
                     lines = ["Your tracked cases:"]
                     for i, case_row in enumerate(user_cases, 1):
                         case_num = str(case_row.get("case_number") or "Unknown")
+                        normalized_case_id = str(case_row.get("normalized_case_id") or case_num).strip()
                         latest = latest_by_case.get(case_num)
                         if latest and latest.get("hearing_date"):
                             lines.append(f"{i}. {case_num} -> Next hearing: {latest['hearing_date']}")
                         else:
-                            lines.append(f"{i}. {case_num} -> No upcoming listing yet")
+                            hearing_fallback = latest_hearing_by_case.get(normalized_case_id)
+                            if hearing_fallback and hearing_fallback.get("hearing_date"):
+                                lines.append(
+                                    f"{i}. {case_num} -> Next hearing: {hearing_fallback['hearing_date']} (from cause list)"
+                                )
+                            else:
+                                lines.append(
+                                    f"{i}. {case_num} -> No listing found in latest cause lists. We will notify you when listed."
+                                )
 
                     response_text = "\n".join(lines)
             except Exception as db_error:
@@ -655,6 +691,56 @@ def test_whatsapp():
     )
     return {"status": "sent", "sid": sid}
 
+
+@app.get(
+    "/debug/tracked-cases",
+    tags=["System"],
+    summary="Debug tracked cases",
+    description="Returns active tracked cases with normalized identifiers.",
+)
+def debug_tracked_cases():
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, user_phone, case_number, normalized_case_id, cnr, court, status, created_at
+            FROM tracked_cases
+            WHERE status = 'active'
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return {
+            "count": len(rows),
+            "tracked_cases": [dict(row) for row in rows],
+        }
+    finally:
+        conn.close()
+
+
+@app.get(
+    "/debug/latest-hearings",
+    tags=["System"],
+    summary="Debug latest hearings",
+    description="Returns the last 20 hearings from DB for ingestion diagnostics.",
+)
+def debug_latest_hearings():
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id, normalized_case_id, cnr, hearing_date, court_name, item_number, case_title, source_pdf, created_at
+            FROM hearings
+            ORDER BY created_at DESC
+            LIMIT 20
+            """
+        ).fetchall()
+        return {
+            "count": len(rows),
+            "hearings": [dict(row) for row in rows],
+        }
+    finally:
+        conn.close()
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
@@ -663,8 +749,10 @@ if __name__ == "__main__":
 @app.get("/health", tags=["System"], summary="Health Check")
 def health():
     """Returns service health status for deployment monitoring."""
+    scheduler_status = get_scheduler_status()
     return {
         "status": "ok",
-        "ingestion_scheduler": get_scheduler_status(),
+        "ingestion_scheduler": scheduler_status,
+        "scheduler_running": scheduler_status == "running",
         "version": "v1",
     }

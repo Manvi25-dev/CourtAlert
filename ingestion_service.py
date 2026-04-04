@@ -304,6 +304,7 @@ def start_scheduler():
     )
 
     _scheduler.start()
+    logger.info("Scheduler started: ingestion every 30 minutes")
     logger.info("Background scheduler started (ingestion: 30min, reminders: 10min).")
 
 
