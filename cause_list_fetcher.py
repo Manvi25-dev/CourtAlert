@@ -474,7 +474,26 @@ def parse_cause_list_entries(text: str) -> ParseResult:
     for block in blocks:
         block_lines = block.get("lines", [])
         block_text = " ".join(block_lines)
-        raw_case_numbers = extract_all_case_numbers(block_text)
+
+        # Step 1/2: scan all lines before V/s as the case cluster.
+        case_cluster_lines: list[str] = []
+        tail_lines: list[str] = []
+        seen_vs = False
+        for line in block_lines:
+            if re.search(r"\bV/?S\.?\b", line, re.IGNORECASE):
+                seen_vs = True
+                tail_lines.append(line)
+                continue
+            if not seen_vs:
+                case_cluster_lines.append(line)
+            else:
+                tail_lines.append(line)
+
+        case_cluster_text = "\n".join(case_cluster_lines) if case_cluster_lines else block_text
+        raw_case_numbers = extract_all_case_numbers(case_cluster_text)
+        if not raw_case_numbers:
+            raw_case_numbers = extract_all_case_numbers(block_text)
+
         normalized_case_numbers: list[str] = []
         for raw_case in raw_case_numbers:
             normalized_case = _normalize_case_number(raw_case)
@@ -484,6 +503,12 @@ def parse_cause_list_entries(text: str) -> ParseResult:
 
         if not normalized_case_numbers:
             continue
+
+        logger.info(
+            "BLOCK CASE CLUSTER: item=%s cases=%s",
+            block.get("item_number") or "Unknown",
+            normalized_case_numbers,
+        )
 
         petitioner, respondent = _extract_parties(block_text)
         advocates = _extract_advocates(block_lines)

@@ -44,7 +44,7 @@ def normalize_case_id(case_number: str) -> str:
     
     # Strip common prefixes that might have been captured as part of the type
     # e.g. "ADDCASECRLMC" -> "CRLMC"
-    PREFIXES = ["ADD", "CASE", "TRACK", "CHECK", "STATUS", "OF", "FOR", "THE", "IN", "MATTER", "MY"]
+    PREFIXES = ["ADD", "CASE", "TRACK", "CHECK", "STATUS", "OF", "FOR", "THE", "IN", "MATTER", "MY", "WITH", "AND"]
     
     # We loop until no prefix matches
     while True:
