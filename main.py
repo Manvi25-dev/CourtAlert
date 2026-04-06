@@ -357,11 +357,21 @@ async def whatsapp_webhook(request: Request):
                     response_text = "You are not tracking any cases yet."
                 else:
                     latest_hearing_by_case: dict[str, dict] = {}
-                    normalized_case_ids = [
-                        str(case_row.get("normalized_case_id") or case_row.get("case_number") or "").strip()
-                        for case_row in user_cases
-                    ]
-                    normalized_case_ids = [case_id for case_id in normalized_case_ids if case_id]
+                    normalized_case_ids: list[str] = []
+                    for case_row in user_cases:
+                        raw_case_id = str(case_row.get("normalized_case_id") or case_row.get("case_number") or "").strip()
+                        if not raw_case_id:
+                            continue
+
+                        candidates = [raw_case_id]
+                        canonical_case = normalize_case_number(raw_case_id)
+                        if canonical_case and canonical_case not in candidates:
+                            candidates.append(canonical_case)
+
+                        for candidate in candidates:
+                            if candidate and candidate not in normalized_case_ids:
+                                normalized_case_ids.append(candidate)
+
                     if normalized_case_ids:
                         conn = get_db_connection()
                         try:

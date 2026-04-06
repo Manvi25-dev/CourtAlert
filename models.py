@@ -659,13 +659,33 @@ def remove_tracked_case(phone_number: str, case_number: str) -> bool:
 
 
 def get_hearings_for_case(case_number: str) -> List[dict]:
-    normalized = normalize_case_id(case_number)
+    candidates: list[str] = []
+
+    canonical = _normalize_case_for_storage(case_number)
+    if canonical:
+        candidates.append(canonical)
+
+    legacy = normalize_case_id(case_number)
+    if legacy:
+        try:
+            case_type, number, year = legacy.split("-", 2)
+            slash_form = f"{case_type}/{int(number)}/{year}"
+            if slash_form not in candidates:
+                candidates.append(slash_form)
+        except ValueError:
+            pass
+
+    raw = str(case_number or "").strip().upper()
+    if raw and raw not in candidates:
+        candidates.append(raw)
+
     conn = get_db_connection()
     try:
-        if normalized:
+        if candidates:
+            placeholders = ",".join("?" for _ in candidates)
             rows = conn.execute(
-                "SELECT * FROM hearings WHERE normalized_case_id = ? ORDER BY hearing_date DESC",
-                (normalized,),
+                f"SELECT * FROM hearings WHERE normalized_case_id IN ({placeholders}) ORDER BY hearing_date DESC",
+                tuple(candidates),
             ).fetchall()
         else:
             rows = []
