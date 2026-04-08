@@ -11,17 +11,18 @@ from datetime import datetime
 from uuid import uuid4
 
 from alert_service import build_alert_payload
+from ecourts_api import API_UNAVAILABLE_MESSAGE, build_case_status_message, match_case_listing
 from case_matcher import normalize_case_number as matcher_normalize_case_number
 from case_matcher import run_matching_pipeline
 from case_parser import normalize_case_id, parse_case_number
-from cause_list_fetcher import fetch_and_parse_cause_lists, parse_cause_list_pdf
+from cause_list_fetcher import fetch_and_parse_cause_lists
 from court_sources import court_sources, resolve_court_from_case, today_iso
-from gurugram_fetcher import fetch_gurugram_district_pdfs
 from models import (
     add_tracked_case,
     add_user,
     get_connection,
     get_user_by_phone,
+    get_user_cases,
 )
 from services.ai_parser import ai_parse_message
 from services.parser import parse_message
@@ -60,27 +61,10 @@ def _fetch_entries_for_court(court_key: str) -> tuple[list[dict], str]:
         entries = fetch_and_parse_cause_lists()
         return entries, "cause_list_fetcher.fetch_and_parse_cause_lists"
 
-    if court_key == "gurugram":
-        entries: list[dict] = []
-        pdf_paths = fetch_gurugram_district_pdfs()
-        for pdf_path in pdf_paths:
-            parsed_rows, extracted_date = parse_cause_list_pdf(pdf_path)
-            for row in parsed_rows:
-                entries.append(
-                    {
-                        "case_number": row.get("case_number") or row.get("case_no"),
-                        "title": row.get("title"),
-                        "court": row.get("court") or "District and Sessions Courts, Gurugram",
-                        "hearing_date": row.get("hearing_date") or extracted_date,
-                        "raw": row.get("raw") or "",
-                    }
-                )
-        return entries, "gurugram_fetcher.fetch_gurugram_district_pdfs"
-
-    if court_key == "sonipat":
-        source = court_sources.get("sonipat")
+    if court_key in {"gurugram", "sonipat"}:
+        source = court_sources.get(court_key)
         entries = source.fetch_cases(today_iso()) if source else []
-        return entries, "court_sources.court_sources['sonipat'].fetch_cases"
+        return entries, f"court_sources.court_sources['{court_key}'].fetch_cases"
 
     entries = fetch_and_parse_cause_lists()
     return entries, "cause_list_fetcher.fetch_and_parse_cause_lists"
@@ -116,6 +100,15 @@ def _safe_send_whatsapp(user_number: str, reply_text: str, request_id: str) -> s
         return None
 
 
+def _resolve_live_source_key(case_number: str | None, court_name: str | None = None) -> str:
+    court_text = (court_name or "").lower()
+    if "gurugram" in court_text or "gurgaon" in court_text:
+        return "gurugram"
+    if "sonipat" in court_text or "sonepat" in court_text:
+        return "sonipat"
+    return resolve_court_from_case(case_number, court_name)["court_key"]
+
+
 def process_user_message(message: str, user_number: str, request_id: str | None = None) -> dict:
     request_id = request_id or uuid4().hex[:12]
     logger.info("[req:%s] message received: user=%s text=%s", request_id, user_number, message)
@@ -136,6 +129,56 @@ def process_user_message(message: str, user_number: str, request_id: str | None 
 
     matched_case = _normalize_case_for_pipeline(parsed_case or message)
     logger.info("[req:%s] matched case: %s", request_id, matched_case)
+
+    if intent == "QUERY_STATUS":
+        user_cases = get_user_cases(user_number)
+        tracked_row = None
+        tracked_case = matched_case
+
+        if tracked_case:
+            for row in user_cases:
+                row_case = _normalize_case_for_pipeline(row.get("case_number") or row.get("normalized_case_id"))
+                if row_case == tracked_case:
+                    tracked_row = row
+                    break
+        elif user_cases:
+            tracked_row = user_cases[0]
+            tracked_case = _normalize_case_for_pipeline(tracked_row.get("case_number") or tracked_row.get("normalized_case_id"))
+
+        if not tracked_case:
+            reply = "Please share the case number you want me to check."
+            logger.info("[req:%s] response sent: %s", request_id, reply)
+            send_sid = _safe_send_whatsapp(user_number, reply, request_id)
+            return {
+                "request_id": request_id,
+                "status": "missing_case",
+                "response_text": reply,
+                "whatsapp_sid": send_sid,
+            }
+
+        source_key = _resolve_live_source_key(tracked_case, (tracked_row or {}).get("court"))
+        source = court_sources.get(source_key)
+        if not source:
+            reply = API_UNAVAILABLE_MESSAGE
+        else:
+            live_entries = source.fetch_cases(today_iso())
+            live_meta = getattr(source, "last_fetch_meta", {})
+            if live_meta.get("api_status") == "failure":
+                reply = API_UNAVAILABLE_MESSAGE
+            else:
+                listing = match_case_listing(tracked_case, live_entries, checked_date=today_iso())
+                reply = build_case_status_message(tracked_case, {"api_status": "success", "result": listing, "checked_date": today_iso()})
+
+        logger.info("[req:%s] response sent: %s", request_id, reply)
+        send_sid = _safe_send_whatsapp(user_number, reply, request_id)
+        return {
+            "request_id": request_id,
+            "status": "success" if reply != API_UNAVAILABLE_MESSAGE else "api_unavailable",
+            "intent": intent,
+            "case_number": tracked_case,
+            "response_text": reply,
+            "whatsapp_sid": send_sid,
+        }
 
     if not matched_case:
         reply = "Case number is invalid or incomplete. Example: add case CS(OS) 3336/2011"
@@ -164,7 +207,7 @@ def process_user_message(message: str, user_number: str, request_id: str | None 
         phone_number=user_number,
         case_number=matched_case,
         normalized_id=matched_case,
-        court=court_name,
+        court=None,
     )
     logger.info("[req:%s] alert registered: added=%s", request_id, added)
 

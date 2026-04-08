@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from ecourts_api import API_UNAVAILABLE_MESSAGE, build_case_status_message, match_case_listing
+from court_sources import court_sources as live_court_sources, resolve_court_from_case, today_iso
 from models import (
     init_db,
     get_db_connection,
@@ -49,6 +51,15 @@ logger = logging.getLogger(__name__)
 API_V1_PREFIX = "/api/v1"
 IN_MEMORY_CASE_STORE: list[dict[str, str]] = []
 WHATSAPP_FALLBACK_REPLY = "I didn't understand. Try: Add case XYZ"
+
+
+def _resolve_live_source_key(case_number: str | None, court_name: str | None = None) -> str:
+    court_text = (court_name or "").lower()
+    if "gurugram" in court_text or "gurgaon" in court_text:
+        return "gurugram"
+    if "sonipat" in court_text or "sonepat" in court_text:
+        return "sonipat"
+    return resolve_court_from_case(case_number, court_name)["court_key"]
 
 
 def _current_whatsapp_webhook_url() -> str:
@@ -263,6 +274,12 @@ def _send_whatsapp_reply(user_number: str, reply_text: str) -> str | None:
     logger.info("Outgoing WhatsApp sent: to=%s sid=%s body=%s", user_number, sid, reply_text)
     return sid
 
+def _extract_simple_webhook_fields(payload: dict) -> tuple[str, str]:
+    phone = payload.get("phone") or payload.get("From") or payload.get("from") or payload.get("user_phone_number") or ""
+    message = payload.get("message") or payload.get("Body") or payload.get("message_content") or payload.get("Message") or ""
+    return str(phone).strip(), str(message).strip()
+
+
 @app.post(f"{API_V1_PREFIX}/webhook")
 @app.post(
     "/webhook",
@@ -270,15 +287,29 @@ def _send_whatsapp_reply(user_number: str, reply_text: str) -> str | None:
     summary="Receive Webhook Message",
     description="Receives WhatsApp-style messages and extracts case numbers to track.",
 )
-def webhook(payload: WebhookMessage, request: Request):
+async def webhook(request: Request):
     request_id = uuid4().hex[:12]
+
+    payload: dict
+    content_type = (request.headers.get("content-type") or "").lower()
+    if "application/json" in content_type:
+        payload = await request.json()
+    else:
+        form = await request.form()
+        payload = dict(form)
+
+    phone, message = _extract_simple_webhook_fields(payload)
+    if not phone or not message:
+        logger.warning("Inbound webhook missing phone/message: request_id=%s payload=%s", request_id, payload)
+        return Response("Missing phone or message", status_code=400, media_type="text/plain")
+
     logger.info(
         "Inbound JSON webhook: request_id=%s from=%s message=%s",
         request_id,
-        payload.phone,
-        payload.message,
+        phone,
+        message,
     )
-    result = process_user_message(payload.message, payload.phone, request_id=request_id)
+    result = process_user_message(message, phone, request_id=request_id)
     return {
         "status": result.get("status", "success"),
         "request_id": request_id,
@@ -340,92 +371,50 @@ async def whatsapp_webhook(request: Request):
                 logger.error("DB error while storing case: request_id=%s error=%s", request_id, db_error)
                 response_text = f"Error tracking case {detected_case}. Please try again."
         
-        # Handle "list/status" action - show user's tracked cases and upcoming hearings
+        # Handle "list/status" action - fetch live listings for tracked cases.
         elif action == "list/status":
             try:
                 user_cases = get_user_cases(from_number)
-                alerts = get_user_alerts_with_hearings(from_number)
                 logger.info(
-                    "Fetched status data: request_id=%s phone=%s cases=%d alerts=%d",
+                    "Fetched status data: request_id=%s phone=%s cases=%d",
                     request_id,
                     from_number,
                     len(user_cases),
-                    len(alerts),
                 )
 
                 if not user_cases:
                     response_text = "You are not tracking any cases yet."
                 else:
-                    latest_hearing_by_case: dict[str, dict] = {}
-                    normalized_case_ids: list[str] = []
-                    for case_row in user_cases:
-                        raw_case_id = str(case_row.get("normalized_case_id") or case_row.get("case_number") or "").strip()
-                        if not raw_case_id:
-                            continue
-
-                        candidates = [raw_case_id]
-                        canonical_case = normalize_case_number(raw_case_id)
-                        if canonical_case and canonical_case not in candidates:
-                            candidates.append(canonical_case)
-
-                        for candidate in candidates:
-                            if candidate and candidate not in normalized_case_ids:
-                                normalized_case_ids.append(candidate)
-
-                    if normalized_case_ids:
-                        conn = get_db_connection()
-                        try:
-                            placeholders = ",".join("?" for _ in normalized_case_ids)
-                            hearing_rows = conn.execute(
-                                f"""
-                                SELECT normalized_case_id, hearing_date, court_name, created_at
-                                FROM hearings
-                                WHERE normalized_case_id IN ({placeholders})
-                                ORDER BY hearing_date DESC, created_at DESC
-                                """,
-                                tuple(normalized_case_ids),
-                            ).fetchall()
-                            for row in hearing_rows:
-                                row_dict = dict(row)
-                                key = str(row_dict.get("normalized_case_id") or "").strip()
-                                if key and key not in latest_hearing_by_case:
-                                    latest_hearing_by_case[key] = row_dict
-                        finally:
-                            conn.close()
-
-                    latest_by_case: dict[str, dict] = {}
-                    for alert in alerts:
-                        case_num = str(alert.get("case_number") or "").strip()
-                        if not case_num:
-                            continue
-                        current = latest_by_case.get(case_num)
-                        if not current:
-                            latest_by_case[case_num] = alert
-                            continue
-                        curr_date = str(current.get("hearing_date") or "")
-                        new_date = str(alert.get("hearing_date") or "")
-                        if new_date and (not curr_date or new_date > curr_date):
-                            latest_by_case[case_num] = alert
-
                     lines = ["Your tracked cases:"]
+                    api_failed = False
+
                     for i, case_row in enumerate(user_cases, 1):
-                        case_num = str(case_row.get("case_number") or "Unknown")
+                        case_num = str(case_row.get("case_number") or "Unknown").strip()
                         normalized_case_id = str(case_row.get("normalized_case_id") or case_num).strip()
-                        latest = latest_by_case.get(case_num)
-                        if latest and latest.get("hearing_date"):
-                            lines.append(f"{i}. {case_num} -> Next hearing: {latest['hearing_date']}")
-                        else:
-                            hearing_fallback = latest_hearing_by_case.get(normalized_case_id)
-                            if hearing_fallback and hearing_fallback.get("hearing_date"):
-                                lines.append(
-                                    f"{i}. {case_num} -> Next hearing: {hearing_fallback['hearing_date']} (from cause list)"
-                                )
-                            else:
-                                lines.append(
-                                    f"{i}. {case_num} -> No listing found in latest cause lists. We will notify you when listed."
-                                )
+                        court_name = str(case_row.get("court") or "").strip()
+                        source_key = _resolve_live_source_key(normalized_case_id, court_name)
+                        source = live_court_sources.get(source_key)
+
+                        if not source:
+                            api_failed = True
+                            lines.append(f"{i}. {case_num} -> {API_UNAVAILABLE_MESSAGE}")
+                            continue
+
+                        live_entries = source.fetch_cases(today_iso())
+                        live_meta = getattr(source, "last_fetch_meta", {})
+                        if live_meta.get("api_status") == "failure":
+                            api_failed = True
+                            lines.append(f"{i}. {case_num} -> {API_UNAVAILABLE_MESSAGE}")
+                            continue
+
+                        lookup = match_case_listing(normalized_case_id, live_entries, checked_date=today_iso())
+                        lines.append(
+                            f"{i}. {build_case_status_message(case_num, {'api_status': 'success', 'result': lookup, 'checked_date': today_iso()})}"
+                        )
 
                     response_text = "\n".join(lines)
+                    if api_failed and len(lines) == 1:
+                        response_text = API_UNAVAILABLE_MESSAGE
             except Exception as db_error:
                 logger.error("DB error while fetching alerts: request_id=%s error=%s", request_id, db_error)
                 response_text = "Error fetching your cases. Please try again."

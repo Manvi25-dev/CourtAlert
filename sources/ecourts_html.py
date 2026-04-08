@@ -5,8 +5,19 @@ from sources.base import SourceAdapter
 
 
 class ECourtsHTMLAdapter(SourceAdapter):
-    def __init__(self, district: str = "Sonepat", base_url: str = "https://ecourtsindia.com/causelist/HR/13"):
-        self.impl = HTMLCauseListSource(name="sonipat", district=district, base_url=base_url)
+    def __init__(
+        self,
+        district: str = "Sonepat",
+        state_code: str = "HR",
+        district_id: int = 13,
+        name: str = "sonipat",
+    ):
+        self.impl = HTMLCauseListSource(
+            name=name,
+            district=district,
+            state_code=state_code,
+            district_id=district_id,
+        )
 
     def fetch(self, hearing_date: str) -> str:
         # HTML source performs multi-step discovery internally in fetch_cases.

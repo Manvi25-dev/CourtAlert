@@ -25,11 +25,28 @@ class CourtPortalFormAdapter(SourceAdapter):
         try:
             payload = fetch_cause_list(self.base_url)
             pdf_count = len(payload.get("pdf_links") or [])
-            logger.info("Delhi HC source discovered %d pdf links", pdf_count)
+            selection = payload.get("selection") or {}
+            if payload.get("error"):
+                logger.error("Delhi HC source selection error: %s", payload.get("error"))
+            logger.info(
+                "Delhi HC source discovered %d selected_pdf=%s selected_date=%s reason=%s",
+                pdf_count,
+                selection.get("selected_pdf"),
+                selection.get("date"),
+                selection.get("reason"),
+            )
             return payload
         except Exception as exc:
             logger.exception("Delhi HC source fetch failed: %s", exc)
-            return {"type": "html", "source_url": self.base_url, "html": "", "pdf_links": [], "pdf_bytes": None}
+            return {
+                "type": "html",
+                "source_url": self.base_url,
+                "html": "",
+                "pdf_links": [],
+                "pdf_bytes": None,
+                "selection": None,
+                "error": str(exc),
+            }
 
     def parse(self, content: Any, hearing_date: str) -> list[dict]:
         parsed_rows: list[dict] = []
