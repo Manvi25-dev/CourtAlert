@@ -111,6 +111,64 @@ def _extract_case_number_manual(message_text: str) -> str | None:
     return normalize_case_number(extracted) or extracted
 
 
+def extract_identifiers_universal(message_text: str) -> dict | None:
+    """Universal extraction for CNR and case numbers. NEVER rejects valid identifiers.
+    
+    Handles:
+    - CNR: GJDH020024462018, CNR:GJDH020024462018, HRS0010076892025
+    - Case numbers: LPA 171/2019, case 171 of 2019, CRL.M.C. 123/2024
+    
+    Returns:
+        {"type": "CNR"|"CASE_NUMBER", "value": "identifier"} or None
+    """
+    msg = (message_text or "").upper().strip()
+    
+    logger.info("EXTRACT_IDENTIFIERS: RAW_MESSAGE=%s", msg)
+    
+    # Try CNR first: 4-letter prefix + 12-13 digits (16 total)
+    # Pattern: GJDH020024462018 or CNR:GJDH020024462018
+    cnr_match = re.search(r"([A-Z]{4}\d{12,13})", msg)
+    if cnr_match:
+        cnr = cnr_match.group(1)
+        logger.info("EXTRACT_IDENTIFIERS: DETECTED_CNR=%s", cnr)
+        return {
+            "type": "CNR",
+            "value": cnr
+        }
+    
+    # Try case number: letter prefix + number + year
+    # Patterns: LPA 171/2019, case 171 of 2019, CRL.M.C. 123/2024
+    case_match = re.search(
+        r"([A-Z][A-Z\.]{1,8})[\s\-/]?(\d{1,7})(?:[\s\-/]*(?:OF)?[\s\-/]*(\d{2,4}))?",
+        msg
+    )
+    if case_match:
+        case_type = case_match.group(1)
+        case_no = case_match.group(2)
+        case_year = case_match.group(3) or ""
+        
+        # Only return if we have at least 2-3 digits (to avoid false positives)
+        if len(case_no) >= 2:
+            case_value = f"{case_type}/{case_no}" + (f"/{case_year}" if case_year else "")
+            # Clean up case type (remove dots for normalization)
+            case_type_clean = case_type.replace(".", "")
+            case_value_clean = f"{case_type_clean}/{case_no}" + (f"/{case_year}" if case_year else "")
+            # Try to normalize
+            normalized = normalize_case_number(case_value_clean) or normalize_case_number(case_value)
+            if normalized:
+                case_value = normalized
+            else:
+                case_value = case_value_clean
+            logger.info("EXTRACT_IDENTIFIERS: DETECTED_CASE=%s", case_value)
+            return {
+                "type": "CASE_NUMBER",
+                "value": case_value
+            }
+    
+    logger.info("EXTRACT_IDENTIFIERS: NO_IDENTIFIER_FOUND")
+    return None
+
+
 def _detect_action_manual(message_text: str) -> str:
     upper = (message_text or "").strip().upper()
     if upper.startswith("ADD CASE ") or upper.startswith("ADD "):
@@ -342,13 +400,19 @@ async def whatsapp_webhook(request: Request):
         
         # Handle "add/track" action with valid case number
         if action == "add/track":
-            detected_case = _extract_case_number_manual(message_text)
-            logger.info("Add intent details: request_id=%s phone=%s case=%s", request_id, from_number, detected_case)
+            extracted = extract_identifiers_universal(message_text)
+            logger.info("EXTRACT_RESULT: request_id=%s extracted=%s", request_id, extracted)
 
-            if not detected_case:
-                response_text = "Invalid format. Try: add case CRL.M.C. 123/2024"
-                logger.info("Add intent without case: request_id=%s phone=%s", request_id, from_number)
-                return Response(response_text, media_type="text/plain")
+            if not extracted:
+                detected_case = _extract_case_number_manual(message_text)
+                if not detected_case:
+                    response_text = "I couldn't recognize case/CNR. Try:\n✓ LPA 171/2019\n✓ GJDH020024462018"
+                    logger.info("No identifier found: request_id=%s phone=%s", request_id, from_number)
+                    return Response(response_text, media_type="text/plain")
+            else:
+                detected_case = extracted["value"]
+
+            logger.info("Add intent details: request_id=%s phone=%s case=%s type=%s", request_id, from_number, detected_case, extracted.get("type") if extracted else "unknown")
 
             try:
                 # Add user to DB
@@ -359,7 +423,7 @@ async def whatsapp_webhook(request: Request):
                 success = add_tracked_case(from_number, detected_case)
                 
                 if success:
-                    response_text = f"Case {detected_case} is now being tracked."
+                    response_text = f"✅ Tracking {detected_case}"
                     logger.info("Case stored successfully: request_id=%s phone=%s case=%s", 
                                request_id, from_number, detected_case)
                 else:
