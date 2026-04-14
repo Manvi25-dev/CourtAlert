@@ -53,6 +53,8 @@ logger = logging.getLogger(__name__)
 API_V1_PREFIX = "/api/v1"
 IN_MEMORY_CASE_STORE: list[dict[str, str]] = []
 WHATSAPP_FALLBACK_REPLY = "I didn't understand. Try: Add case XYZ"
+ADD_CASE_CMD_RE = re.compile(r"^\s*ADD\s+CASE(?:\s+(.*))?$", re.IGNORECASE)
+SIMPLE_CASE_NUMBER_RE = re.compile(r"^([A-Z]+)/(\d+)/(\d{4})$")
 
 
 def _resolve_live_source_key(case_number: str | None, court_name: str | None = None) -> str:
@@ -97,6 +99,34 @@ def _extract_whatsapp_fields(payload: dict) -> tuple[str, str, str]:
         or ""
     )
     return str(message_text).strip(), normalized_phone, str(media_url).strip()
+
+
+def parse_add_case_command(message_text: str) -> dict | None:
+    cmd_match = ADD_CASE_CMD_RE.match(message_text or "")
+    if not cmd_match:
+        return None
+
+    raw_case = (cmd_match.group(1) or "").strip()
+    if not raw_case:
+        return {
+            "error": "Please provide a case number (e.g., COMI/257/2019)",
+        }
+
+    # Normalize by uppercasing and removing extra spaces.
+    normalized_case = re.sub(r"\s+", "", raw_case.upper())
+    case_match = SIMPLE_CASE_NUMBER_RE.match(normalized_case)
+    if not case_match:
+        return {
+            "error": "Invalid case format. Please use format like COMI/257/2019",
+        }
+
+    case_type, case_number, year = case_match.groups()
+    return {
+        "case_type": case_type,
+        "case_number": case_number,
+        "year": year,
+        "normalized_case": f"{case_type}/{int(case_number)}/{year}",
+    }
 
 
 def _twilio_message_response(message_text: str, status_code: int = 200) -> Response:
@@ -408,17 +438,36 @@ async def whatsapp_webhook(request: Request):
         
         # Handle "add/track" action with valid case number
         if action == "add/track":
-            extracted = extract_identifiers_universal(message_text)
+            simple_parse = parse_add_case_command(message_text)
+            if simple_parse is None:
+                logger.info("Add command ignored: request_id=%s message=%s", request_id, message_text)
+                response_text = "I didn't understand. Try:\n- add case COMI/257/2019\n- when is it?"
+                return _twilio_message_response(response_text)
+
+            if simple_parse.get("error"):
+                extracted_universal = extract_identifiers_universal(message_text)
+                if extracted_universal and extracted_universal.get("type") == "CNR":
+                    detected_case = str(extracted_universal["value"])
+                    extracted = extracted_universal
+                else:
+                    return _twilio_message_response(str(simple_parse["error"]))
+            else:
+                detected_case = str(simple_parse["normalized_case"])
+                extracted = {"type": "CASE_NUMBER", "value": detected_case}
+
             logger.info("EXTRACT_RESULT: request_id=%s extracted=%s", request_id, extracted)
 
-            if not extracted:
-                detected_case = _extract_case_number_manual(message_text)
-                if not detected_case:
-                    response_text = "I couldn't recognize case/CNR. Try:\n✓ LPA 171/2019\n✓ GJDH020024462018"
-                    logger.info("No identifier found: request_id=%s phone=%s", request_id, from_number)
-                    return _twilio_message_response(response_text)
-            else:
-                detected_case = extracted["value"]
+            # Keep CNR handling for add case CNR:<value> style payloads.
+            if not extract_cnr(detected_case):
+                extracted_universal = extract_identifiers_universal(message_text)
+                if extracted_universal and extracted_universal.get("type") == "CNR":
+                    extracted = extracted_universal
+                    detected_case = str(extracted_universal["value"])
+
+            if not detected_case:
+                response_text = "Invalid case format. Please use format like COMI/257/2019"
+                logger.info("No identifier found: request_id=%s phone=%s", request_id, from_number)
+                return _twilio_message_response(response_text)
 
             logger.info("Add intent details: request_id=%s phone=%s case=%s type=%s", request_id, from_number, detected_case, extracted.get("type") if extracted else "unknown")
 
