@@ -3,6 +3,7 @@ import re
 import os
 import asyncio
 import traceback
+from xml.sax.saxutils import escape as xml_escape
 from uuid import uuid4
 from datetime import datetime, timezone
 from contextlib import asynccontextmanager
@@ -95,6 +96,12 @@ def _extract_whatsapp_fields(payload: dict) -> tuple[str, str, str]:
         or ""
     )
     return str(message_text).strip(), normalized_phone, str(media_url).strip()
+
+
+def _twilio_message_response(message_text: str, status_code: int = 200) -> Response:
+    safe_text = xml_escape(message_text or "")
+    twiml = f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{safe_text}</Message></Response>'
+    return Response(content=twiml, status_code=status_code, media_type="application/xml")
 
 
 def _extract_case_number_manual(message_text: str) -> str | None:
@@ -408,7 +415,7 @@ async def whatsapp_webhook(request: Request):
                 if not detected_case:
                     response_text = "I couldn't recognize case/CNR. Try:\n✓ LPA 171/2019\n✓ GJDH020024462018"
                     logger.info("No identifier found: request_id=%s phone=%s", request_id, from_number)
-                    return Response(response_text, media_type="text/plain")
+                    return _twilio_message_response(response_text)
             else:
                 detected_case = extracted["value"]
 
@@ -489,12 +496,12 @@ async def whatsapp_webhook(request: Request):
         
         logger.info("WhatsApp response: request_id=%s response=%s", request_id, response_text)
         
-        # Return immediately to not block Twilio
-        return Response(response_text, media_type="text/plain")
+        # Twilio webhook replies should be TwiML XML for in-chat responses.
+        return _twilio_message_response(response_text)
         
     except Exception as e:
         logger.error("WhatsApp webhook error: request_id=%s error=%s", request_id, e, exc_info=True)
-        return Response("Error processing message. Please try again.", media_type="text/plain")
+        return _twilio_message_response("Error processing message. Please try again.")
 
 
 def local_test_whatsapp_webhook_simulation() -> list[dict[str, str]]:

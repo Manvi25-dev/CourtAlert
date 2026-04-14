@@ -1,3 +1,4 @@
+import court_sources
 from court_sources import HTMLCauseListSource
 
 
@@ -109,3 +110,36 @@ def test_html_source_discovers_hierarchy_and_merges_cases():
     first = cases[0]
     for key in ["case_number", "title", "court_number", "judge", "status", "hearing_date", "district"]:
         assert key in first
+
+
+def test_html_source_prefers_ecourts_api_when_configured(monkeypatch):
+    src = HTMLCauseListSource(name="sonipat", district="Sonipat", state_code="HR", district_id=13)
+
+    monkeypatch.setattr(court_sources, "is_ecourts_api_configured", lambda: True)
+    monkeypatch.setattr(
+        court_sources,
+        "lookup_case_listings",
+        lambda tracked, court_id, hearing_date, court_label=None: {
+            "api_status": "success",
+            "entries": [
+                {
+                    "case_number": "MACP/458/2025",
+                    "party_names": "Chhanga Ram vs Narender",
+                    "court_number": "12",
+                    "hearing_date": hearing_date,
+                    "judge": "Example Judge",
+                    "status": "Listed",
+                    "raw": {"case_number": "MACP/458/2025"},
+                }
+            ],
+            "matches_found": 0,
+        },
+    )
+
+    cases = src.fetch_cases("2026-04-14")
+
+    assert len(cases) == 1
+    assert cases[0]["case_number"] == "MACP/458/2025"
+    assert cases[0]["title"] == "Chhanga Ram vs Narender"
+    assert src.last_fetch_meta["source_mode"] == "api"
+    assert src.last_fetch_meta["api_status"] == "success"
