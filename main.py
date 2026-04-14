@@ -45,6 +45,7 @@ from orchestrator import process_user_message
 from security import limiter, validate_external_audio_url, validate_system_api_key
 from case_parser import extract_all_case_numbers
 from case_matcher import normalize_case_number
+from cnr_service import extract_cnr, fetch_case_details_by_cnr
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -427,7 +428,17 @@ async def whatsapp_webhook(request: Request):
                 logger.info("User added: request_id=%s phone=%s", request_id, from_number)
                 
                 # Add tracked case to DB
-                success = add_tracked_case(from_number, detected_case)
+                extracted_type = (extracted or {}).get("type")
+                detected_cnr = extract_cnr(detected_case) if extracted_type == "CNR" else None
+                if detected_cnr:
+                    success = add_tracked_case(
+                        from_number,
+                        detected_case,
+                        normalized_id=detected_case,
+                        cnr=detected_cnr,
+                    )
+                else:
+                    success = add_tracked_case(from_number, detected_case)
                 
                 if success:
                     response_text = f"✅ Tracking {detected_case}"
@@ -461,6 +472,17 @@ async def whatsapp_webhook(request: Request):
 
                     for i, case_row in enumerate(user_cases, 1):
                         case_num = str(case_row.get("case_number") or "Unknown").strip()
+                        tracked_cnr = str(case_row.get("cnr") or "").strip() or (extract_cnr(case_num) or "")
+
+                        # CNR-tracked entries should not depend on cause-list source routing.
+                        if tracked_cnr:
+                            cnr_details = fetch_case_details_by_cnr(tracked_cnr)
+                            if cnr_details and cnr_details.get("title"):
+                                lines.append(f"{i}. {tracked_cnr} -> Tracking active ({cnr_details.get('title')})")
+                            else:
+                                lines.append(f"{i}. {tracked_cnr} -> Tracking active")
+                            continue
+
                         normalized_case_id = str(case_row.get("normalized_case_id") or case_num).strip()
                         court_name = str(case_row.get("court") or "").strip()
                         source_key = _resolve_live_source_key(normalized_case_id, court_name)
