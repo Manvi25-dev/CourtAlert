@@ -217,10 +217,30 @@ def _detect_action_manual(message_text: str) -> str:
         or upper.startswith("LIST")
         or "WHEN IS IT" in upper
         or "NEXT HEARING" in upper
+        or "NEXT DATE" in upper
+        or "HEARING" in upper
+        or "KAB" in upper
         or "UPDATE ME ON MY CASES" in upper
     ):
         return "list/status"
     return "fallback"
+
+
+def _is_next_hearing_query(message_text: str) -> bool:
+    text = (message_text or "").lower()
+    return any(token in text for token in ("when", "next date", "hearing", "kab"))
+
+
+def _latest_tracked_case(user_cases: list[dict]) -> dict | None:
+    if not user_cases:
+        return None
+
+    def _sort_key(row: dict) -> tuple[str, int]:
+        created_at = str(row.get("created_at") or "")
+        row_id = int(row.get("id") or 0)
+        return created_at, row_id
+
+    return sorted(user_cases, key=_sort_key, reverse=True)[0]
 
 
 async def _process_whatsapp_background(
@@ -512,6 +532,34 @@ async def whatsapp_webhook(request: Request):
                     from_number,
                     len(user_cases),
                 )
+
+                # NEXT_HEARING_QUERY flow for short WhatsApp prompts like
+                # "when is it?", "next date?", "hearing kab hai?".
+                if _is_next_hearing_query(message_text):
+                    if not user_cases:
+                        response_text = "No case found. Please add a case first."
+                    elif len(user_cases) > 1:
+                        response_text = "Which case? Reply with case number."
+                    else:
+                        latest_case = _latest_tracked_case(user_cases)
+                        case_number = str((latest_case or {}).get("case_number") or "").strip()
+                        cnr = str((latest_case or {}).get("cnr") or "").strip() or (extract_cnr(case_number) or "")
+
+                        if not cnr:
+                            response_text = "No upcoming hearing date found. Please check later."
+                        else:
+                            details = fetch_case_details_by_cnr(cnr) or {}
+                            next_date = str(details.get("next_hearing_date") or "").strip()
+                            court_name = str(details.get("court") or "").strip() or "Unknown Court"
+                            case_title = str(details.get("title") or details.get("case_number") or cnr).strip()
+
+                            if next_date:
+                                response_text = f"Next hearing for {case_title} is on {next_date} at {court_name}"
+                            else:
+                                response_text = "No upcoming hearing date found. Please check later."
+
+                    logger.info("Next hearing response: request_id=%s response=%s", request_id, response_text)
+                    return _twilio_message_response(response_text)
 
                 if not user_cases:
                     response_text = "You are not tracking any cases yet."

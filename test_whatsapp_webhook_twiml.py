@@ -57,5 +57,5 @@ def test_whatsapp_status_for_tracked_cnr_returns_tracking_active(monkeypatch, tm
 
     assert resp.status_code == 200
     assert resp.headers.get("content-type", "").startswith("application/xml")
-    assert "Tracking active" in resp.text
+    assert "No upcoming hearing date found. Please check later." in resp.text
     assert "Live data temporarily unavailable" not in resp.text

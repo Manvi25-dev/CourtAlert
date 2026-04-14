@@ -42,21 +42,36 @@ def fetch_case_details_by_cnr(cnr: str, timeout: int = 20) -> dict[str, Any] | N
         if key:
             fields[key] = val
 
-    title = fields.get("case title") or fields.get("title") or ""
-    case_number = fields.get("case no") or fields.get("registration number") or normalized
+    def _pick_field(*aliases: str) -> str:
+        for alias in aliases:
+            value = fields.get(alias)
+            if value:
+                return value
+        return ""
+
+    title = _pick_field("case title", "title")
+    case_number = _pick_field("case no", "registration number") or normalized
+    next_hearing_date = _pick_field(
+        "next hearing date",
+        "next date",
+        "date of hearing",
+        "next hearing",
+        "next hearing dt",
+    )
     details = {
         "cnr": normalized,
         "case_number": case_number,
         "title": title,
-        "court": fields.get("court name") or fields.get("court") or "Unknown Court",
-        "district": fields.get("district") or "",
-        "state": fields.get("state") or "",
-        "case_type": fields.get("case type") or "",
-        "registration_number": fields.get("registration number") or "",
-        "filing_number": fields.get("filing number") or "",
-        "petitioner": fields.get("petitioner") or fields.get("petitioner and advocate") or "",
-        "respondents": fields.get("respondent") or fields.get("respondents") or "",
-        "advocates": fields.get("advocate") or fields.get("advocates") or "",
+        "court": _pick_field("court name", "court") or "Unknown Court",
+        "district": _pick_field("district"),
+        "state": _pick_field("state"),
+        "case_type": _pick_field("case type"),
+        "registration_number": _pick_field("registration number"),
+        "filing_number": _pick_field("filing number"),
+        "petitioner": _pick_field("petitioner", "petitioner and advocate"),
+        "respondents": _pick_field("respondent", "respondents"),
+        "advocates": _pick_field("advocate", "advocates"),
+        "next_hearing_date": next_hearing_date,
     }
 
     return details
