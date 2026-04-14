@@ -14,7 +14,7 @@ DB_PATH = os.getenv("DATABASE_URL", "courtalert.db")
 
 
 _CANONICAL_CASE_RE = re.compile(r"\b([A-Z]+)[\s/\-]+(\d+)[\s/\-]+(\d{4})\b")
-_CNR_RE = re.compile(r"\b([A-Z]{3}[0-9]{13})\b")
+_CNR_RE = re.compile(r"\b([A-Z]{3,4}[0-9]{12,13})\b")
 
 
 def normalize_cnr(value: str | None) -> str | None:

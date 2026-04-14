@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-CNR_PATTERN = re.compile(r"\b([A-Z]{3}[0-9]{13})\b", re.IGNORECASE)
+CNR_PATTERN = re.compile(r"\b([A-Z]{3,4}[0-9]{12,13})\b", re.IGNORECASE)
 
 
 def extract_cnr(text: str) -> str | None:
